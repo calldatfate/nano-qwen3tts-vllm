@@ -62,6 +62,7 @@ class Qwen3TTSInterface:
         enforce_eager: bool = False,
         tensor_parallel_size: int = 1,
         zmq_bridge=None,
+        gpu_memory_utilization: float = 0.6,
     ):
         """Load Qwen3TTSInterface from HuggingFace model repository or local path.
         
@@ -158,14 +159,15 @@ class Qwen3TTSInterface:
             enforce_eager=enforce_eager,
             tensor_parallel_size=tensor_parallel_size,
             zmq_bridge=zmq_bridge,
+            gpu_memory_utilization=gpu_memory_utilization,
         )
     
-    def __init__(self, model_path: str, enforce_eager: bool = False, tensor_parallel_size: int = 1, zmq_bridge=None):
+    def __init__(self, model_path: str, enforce_eager: bool = False, tensor_parallel_size: int = 1, zmq_bridge=None, gpu_memory_utilization: float = 0.6):
         self.model_path = model_path
         self.enforce_eager = enforce_eager
         self.tensor_parallel_size = tensor_parallel_size
         self.zmq_bridge = zmq_bridge
-        self.talker_llm = TalkerLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.3)
+        self.talker_llm = TalkerLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=gpu_memory_utilization)
         self.predictor_llm = PredictorLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size)
         self.processor = _get_processor(model_path)
         self.model_config = self.talker_llm.model_runner.full_config

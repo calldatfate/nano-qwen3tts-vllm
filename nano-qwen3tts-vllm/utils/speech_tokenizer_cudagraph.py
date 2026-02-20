@@ -5,8 +5,8 @@ import torch
 from typing import Union, Tuple, List
 
 try:
-    qwen_tts_path = os.path.expanduser(os.environ.get("QWEN_TTS_PATH", "/home/sang/work/Qwen3-TTS"))
-    if os.path.exists(qwen_tts_path) and qwen_tts_path not in sys.path:
+    qwen_tts_path = os.environ.get("QWEN_TTS_PATH", "")
+    if qwen_tts_path and os.path.exists(qwen_tts_path) and qwen_tts_path not in sys.path:
         sys.path.insert(0, qwen_tts_path)
     from qwen_tts.inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer as _Qwen3TTSTokenizer
     HAS_SPEECH_TOKENIZER = True
@@ -111,6 +111,24 @@ class SpeechTokenizerCUDAGraph:
             print("Skipping CUDA graph capture (CPU or num_graph_lengths=0).")
 
         print(f"Speech tokenizer (CUDAGraph) loaded: sample_rate={self.sample_rate}Hz, device={self.device}")
+
+    def shutdown(self):
+        """Explicitly release all captured CUDA graphs and their tensor buffers."""
+        if hasattr(self.tokenizer, 'model') and hasattr(self.tokenizer.model, 'decoder'):
+            decoder = self.tokenizer.model.decoder
+            if hasattr(decoder, 'graphs'):
+                del decoder.graphs
+            if hasattr(decoder, 'graph_inputs'):
+                del decoder.graph_inputs
+            if hasattr(decoder, 'graph_outputs'):
+                del decoder.graph_outputs
+        
+        self.tokenizer = None
+        import torch
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @torch.inference_mode()
     def decode(self, inputs: List[dict]) -> Tuple[List, int]:

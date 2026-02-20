@@ -68,6 +68,20 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+            
+        # Explicitly delete massive tensors and model weights
+        if hasattr(self, 'kv_cache'):
+            del self.kv_cache
+        if hasattr(self, 'model'):
+            del self.model
+        if hasattr(self, 'sampler'):
+            del self.sampler
+            
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         torch.cuda.synchronize()
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -116,14 +130,16 @@ class ModelRunner:
         hf_config = self.model_config
         torch_dtype = torch.bfloat16
         free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        
+        # When stacking multiple LLMs (e.g. TalkerLLM + PredictorLLM in Base models), 
+        # calculating based on `total * utilization` fails because `used` grows massively after the 1st LLM.
+        # Instead, we allocate KV cache strictly based on 80% of the CURRENTLY FREE VRAM.
+        available_for_kv = free * 0.8
+        config.num_kvcache_blocks = max(16, int(available_for_kv) // block_bytes)
+        
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():

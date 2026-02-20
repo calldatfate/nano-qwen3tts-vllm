@@ -35,11 +35,40 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
-        atexit.unregister(self.exit)
-        self.model_runner.call("exit")
-        del self.model_runner
+        try:
+            atexit.unregister(self.exit)
+        except:
+            pass
+            
+        if hasattr(self, 'model_runner') and self.model_runner is not None:
+            try:
+                self.model_runner.call("exit")
+            except Exception:
+                pass
+            del self.model_runner
+            self.model_runner = None
+            
+        if hasattr(self, 'scheduler'):
+            del self.scheduler
+            
+        if hasattr(self, 'tokenizer'):
+            del self.tokenizer
+            
         for p in self.ps:
-            p.join()
+            try:
+                p.join(timeout=2.0)
+                if p.is_alive():
+                    p.terminate()
+                    p.join()
+            except Exception:
+                pass
+        self.ps.clear()
+        
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
     #     if isinstance(prompt, str):

@@ -12,8 +12,8 @@ try:
     import sys
     import os
     # Add Qwen3-TTS to path if not already there
-    qwen_tts_path = os.path.expanduser('/home/sang/work/Qwen3-TTS')
-    if os.path.exists(qwen_tts_path) and qwen_tts_path not in sys.path:
+    qwen_tts_path = os.environ.get("QWEN_TTS_PATH", "")
+    if qwen_tts_path and os.path.exists(qwen_tts_path) and qwen_tts_path not in sys.path:
         sys.path.insert(0, qwen_tts_path)
     
     from qwen_tts.inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer as _Qwen3TTSTokenizer
