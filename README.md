@@ -8,7 +8,7 @@ Flash-Attention and Triton require a Linux environment. On Windows, this is achi
 
 ## 1. Installation
 
-### 🐧 Native Linux (Ubuntu/Debian)
+###  Native Linux (Ubuntu/Debian)
 ```bash
 # 1. Install prerequisites (SoX is required for audio processing)
 sudo apt update && sudo apt install -y sox libsox-dev
@@ -21,7 +21,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 🪟 Windows (via WSL2)
+### Windows (via WSL2)
 ```bash
 # 1. Open your Windows terminal and enter the WSL subsystem
 wsl
