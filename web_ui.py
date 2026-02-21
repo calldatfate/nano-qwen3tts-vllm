@@ -41,7 +41,7 @@ def load_model(model_name):
         import traceback
         return False, f"Error loading model: {e}\n{traceback.format_exc()}"
 
-def generate_tts(model_selection, text, instruction_text, speaker_selection, ref_audio_path, ref_text, language):
+def generate_tts(model_selection, text, instruction_text, speaker_selection, ref_audio_path, ref_text, language, temperature):
     global interface
     
     # 1. Load the model if it's different from the currently loaded one
@@ -57,6 +57,7 @@ def generate_tts(model_selection, text, instruction_text, speaker_selection, ref
                 text=text,
                 language=language,
                 instruct=instruction_text,
+                temperature=temperature,
             ))
         elif "CustomVoice" in model_selection:
             # CustomVoice mode uses predefined speakers (Vivian, Mike, etc.)
@@ -64,11 +65,12 @@ def generate_tts(model_selection, text, instruction_text, speaker_selection, ref
                 text=text,
                 language=language,
                 speaker=speaker_selection,
+                temperature=temperature,
             ))
         elif "Base" in model_selection:
             # Base mode requires reference audio
             if not ref_audio_path:
-                return None, "Для клонирования голоса обязательно загрузите оригинальное аудио."
+                return None, "Р”Р»СЏ РєР»РѕРЅРёСЂРѕРІР°РЅРёСЏ РіРѕР»РѕСЃР° РѕР±СЏР·Р°С‚РµР»СЊРЅРѕ Р·Р°РіСЂСѓР·РёС‚Рµ РѕСЂРёРіРёРЅР°Р»СЊРЅРѕРµ Р°СѓРґРёРѕ."
                 
             if not ref_text.strip():
                 try:
@@ -78,9 +80,9 @@ def generate_tts(model_selection, text, instruction_text, speaker_selection, ref
                     segments, info = whisper_model.transcribe(ref_audio_path, beam_size=5)
                     ref_text = " ".join([segment.text for segment in segments]).strip()
                     if not ref_text:
-                        raise ValueError("Whisper распознал пустую строку")
+                        raise ValueError("Whisper СЂР°СЃРїРѕР·РЅР°Р» РїСѓСЃС‚СѓСЋ СЃС‚СЂРѕРєСѓ")
                 except Exception as e:
-                    return None, f"Ошибка авто-распознавания текста: {e}. Пожалуйста, введите текст вручную."
+                    return None, f"РћС€РёР±РєР° Р°РІС‚Рѕ-СЂР°СЃРїРѕР·РЅР°РІР°РЅРёСЏ С‚РµРєСЃС‚Р°: {e}. РџРѕР¶Р°Р»СѓР№СЃС‚Р°, РІРІРµРґРёС‚Рµ С‚РµРєСЃС‚ РІСЂСѓС‡РЅСѓСЋ."
             
             ref_audio, ref_sr = sf.read(ref_audio_path)
             prompt = interface.create_voice_clone_prompt(
@@ -92,7 +94,8 @@ def generate_tts(model_selection, text, instruction_text, speaker_selection, ref
             audio_codes = list(interface.generate_voice_clone(
                 text=text,
                 language=language,
-                prompt=prompt
+                prompt=prompt,
+                temperature=temperature,
             ))
         else:
             return None, "Model type not supported via this UI yet."
@@ -104,10 +107,10 @@ def generate_tts(model_selection, text, instruction_text, speaker_selection, ref
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         sf.write(temp_file.name, wavs[0], sr)
         
-        return temp_file.name, "Успешная генерация!"
+        return temp_file.name, "РЈСЃРїРµС€РЅР°СЏ РіРµРЅРµСЂР°С†РёСЏ!"
     except Exception as e:
         import traceback
-        return None, f"Ошибка при генерации: {str(e)}\n\n{traceback.format_exc()}"
+        return None, f"РћС€РёР±РєР° РїСЂРё РіРµРЅРµСЂР°С†РёРё: {str(e)}\n\n{traceback.format_exc()}"
 
 def update_ui_for_model(model_name):
     """Dynamically change visibility depending on the chosen model"""
@@ -118,42 +121,42 @@ def update_ui_for_model(model_name):
 
 # Gradio Interface
 with gr.Blocks(title="Qwen3-TTS Web UI") as demo:
-    gr.Markdown("# 🎙️ Qwen3-TTS Web UI")
-    gr.Markdown("Генерация речи с использованием `nano-vLLM`. Модель загружается в память автоматически при первом запросе.")
+    gr.Markdown("# рџЋ™пёЏ Qwen3-TTS Web UI")
+    gr.Markdown("Р“РµРЅРµСЂР°С†РёСЏ СЂРµС‡Рё СЃ РёСЃРїРѕР»СЊР·РѕРІР°РЅРёРµРј `nano-vLLM`. РњРѕРґРµР»СЊ Р·Р°РіСЂСѓР¶Р°РµС‚СЃСЏ РІ РїР°РјСЏС‚СЊ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё РїСЂРё РїРµСЂРІРѕРј Р·Р°РїСЂРѕСЃРµ.")
     
     with gr.Row():
         with gr.Column():
             model_dropdown = gr.Dropdown(
                 choices=[
-                    "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", # Создание голоса по тексту
-                    "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", # Легкая модель с готовыми дикторами
-                    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", # Тяжелая модель с готовыми дикторами
-                    "Qwen/Qwen3-TTS-12Hz-0.6B-Base",        # Базовая модель клонирования
-                    "Qwen/Qwen3-TTS-12Hz-1.7B-Base"         # Базовая модель клонирования (качественная)
+                    "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", # РЎРѕР·РґР°РЅРёРµ РіРѕР»РѕСЃР° РїРѕ С‚РµРєСЃС‚Сѓ
+                    "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", # Р›РµРіРєР°СЏ РјРѕРґРµР»СЊ СЃ РіРѕС‚РѕРІС‹РјРё РґРёРєС‚РѕСЂР°РјРё
+                    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", # РўСЏР¶РµР»Р°СЏ РјРѕРґРµР»СЊ СЃ РіРѕС‚РѕРІС‹РјРё РґРёРєС‚РѕСЂР°РјРё
+                    "Qwen/Qwen3-TTS-12Hz-0.6B-Base",        # Р‘Р°Р·РѕРІР°СЏ РјРѕРґРµР»СЊ РєР»РѕРЅРёСЂРѕРІР°РЅРёСЏ
+                    "Qwen/Qwen3-TTS-12Hz-1.7B-Base"         # Р‘Р°Р·РѕРІР°СЏ РјРѕРґРµР»СЊ РєР»РѕРЅРёСЂРѕРІР°РЅРёСЏ (РєР°С‡РµСЃС‚РІРµРЅРЅР°СЏ)
                 ],
                 value="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
-                label="Выбор модели"
+                label="Р’С‹Р±РѕСЂ РјРѕРґРµР»Рё"
             )
             
             text_input = gr.Textbox(
-                label="Текст для озвучки", 
+                label="РўРµРєСЃС‚ РґР»СЏ РѕР·РІСѓС‡РєРё", 
                 lines=5, 
-                placeholder="Введите текст здесь...",
-                value="Привет! Я тестирую работу модели Qwen3-TTS на русском языке через веб-интерфейс."
+                placeholder="Р’РІРµРґРёС‚Рµ С‚РµРєСЃС‚ Р·РґРµСЃСЊ...",
+                value="РџСЂРёРІРµС‚! РЇ С‚РµСЃС‚РёСЂСѓСЋ СЂР°Р±РѕС‚Сѓ РјРѕРґРµР»Рё Qwen3-TTS РЅР° СЂСѓСЃСЃРєРѕРј СЏР·С‹РєРµ С‡РµСЂРµР· РІРµР±-РёРЅС‚РµСЂС„РµР№СЃ."
             )
             
             # This field is shown for VoiceDesign
             instruction_input = gr.Textbox(
-                label="Описание голоса (Instruction)", 
+                label="РћРїРёСЃР°РЅРёРµ РіРѕР»РѕСЃР° (Instruction)", 
                 lines=2, 
-                placeholder="Например: Женский голос, профессиональный диктор, четкая речь",
-                value="Женский голос, радостный и энергичный",
+                placeholder="РќР°РїСЂРёРјРµСЂ: Р–РµРЅСЃРєРёР№ РіРѕР»РѕСЃ, РїСЂРѕС„РµСЃСЃРёРѕРЅР°Р»СЊРЅС‹Р№ РґРёРєС‚РѕСЂ, С‡РµС‚РєР°СЏ СЂРµС‡СЊ",
+                value="Р–РµРЅСЃРєРёР№ РіРѕР»РѕСЃ, СЂР°РґРѕСЃС‚РЅС‹Р№ Рё СЌРЅРµСЂРіРёС‡РЅС‹Р№",
                 visible=True
             )
             
             # This field is shown for CustomVoice
             speaker_dropdown = gr.Dropdown(
-                label="Выбор встроенного диктора (Speaker)",
+                label="Р’С‹Р±РѕСЂ РІСЃС‚СЂРѕРµРЅРЅРѕРіРѕ РґРёРєС‚РѕСЂР° (Speaker)",
                 choices=['serena', 'vivian', 'uncle_fu', 'ryan', 'aiden', 'ono_anna', 'sohee', 'eric', 'dylan'],
                 value="serena",
                 visible=False
@@ -161,29 +164,37 @@ with gr.Blocks(title="Qwen3-TTS Web UI") as demo:
             
             # These fields are shown for Voice Cloning (Base models)
             ref_audio_input = gr.Audio(
-                label="Аудио-оригинал для клонирования голоса",
+                label="РђСѓРґРёРѕ-РѕСЂРёРіРёРЅР°Р» РґР»СЏ РєР»РѕРЅРёСЂРѕРІР°РЅРёСЏ РіРѕР»РѕСЃР°",
                 type="filepath",
                 visible=False
             )
             
             ref_text_input = gr.Textbox(
-                label="Текст из оригинального аудио",
+                label="РўРµРєСЃС‚ РёР· РѕСЂРёРіРёРЅР°Р»СЊРЅРѕРіРѕ Р°СѓРґРёРѕ",
                 lines=2,
-                placeholder="Оставьте пустым для АВТОМАТИЧЕСКОГО РАСПОЗНАВАНИЯ через Whisper",
+                placeholder="РћСЃС‚Р°РІСЊС‚Рµ РїСѓСЃС‚С‹Рј РґР»СЏ РђР’РўРћРњРђРўРР§Р•РЎРљРћР“Рћ Р РђРЎРџРћР—РќРђР’РђРќРРЇ С‡РµСЂРµР· Whisper",
                 visible=False
             )
             
             language_dropdown = gr.Dropdown(
                 choices=["Auto", "Russian", "English", "Chinese", "Japanese", "German", "French", "Spanish"],
                 value="Russian",
-                label="Язык"
+                label="РЇР·С‹Рє"
             )
             
-            generate_btn = gr.Button("Генерировать 🔊", variant="primary")
+            temperature_slider = gr.Slider(
+                minimum=0.1,
+                maximum=2.0,
+                step=0.05,
+                value=0.9,
+                label="Temperature"
+            )
+            
+            generate_btn = gr.Button("Р“РµРЅРµСЂРёСЂРѕРІР°С‚СЊ рџ”Љ", variant="primary")
             
         with gr.Column():
-            audio_output = gr.Audio(label="Результирующее аудио", type="filepath")
-            status_output = gr.Textbox(label="Статус / Лог загрузки", interactive=False, lines=4)
+            audio_output = gr.Audio(label="Р РµР·СѓР»СЊС‚РёСЂСѓСЋС‰РµРµ Р°СѓРґРёРѕ", type="filepath")
+            status_output = gr.Textbox(label="РЎС‚Р°С‚СѓСЃ / Р›РѕРі Р·Р°РіСЂСѓР·РєРё", interactive=False, lines=4)
             
     # Watch for model change to toggle visibility of UI elements
     model_dropdown.change(
@@ -194,9 +205,10 @@ with gr.Blocks(title="Qwen3-TTS Web UI") as demo:
             
     generate_btn.click(
         fn=generate_tts,
-        inputs=[model_dropdown, text_input, instruction_input, speaker_dropdown, ref_audio_input, ref_text_input, language_dropdown],
+        inputs=[model_dropdown, text_input, instruction_input, speaker_dropdown, ref_audio_input, ref_text_input, language_dropdown, temperature_slider],
         outputs=[audio_output, status_output]
     )
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860, share=False, theme=gr.themes.Default(primary_hue="blue", secondary_hue="indigo"))
+

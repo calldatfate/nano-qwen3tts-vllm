@@ -206,6 +206,7 @@ async def audio_stream_generator_async(stream_id: str, request_data: dict):
         language = request_data["language"]
         instruction = request_data["instruction"]
         speaker = request_data["speaker"]
+        temperature = request_data.get("temperature", 0.9)
         ref_audio = request_data.get("ref_audio")
         ref_sr = request_data.get("ref_sr")
         ref_text = request_data.get("ref_text")
@@ -227,10 +228,21 @@ async def audio_stream_generator_async(stream_id: str, request_data: dict):
                     )
             loop = asyncio.get_event_loop()
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = await loop.run_in_executor(None, _prep_voice_design)
-            async_gen = interface.generate_async(talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask)
+            async_gen = interface.generate_async(
+                talker_input_embeds,
+                trailing_text_hiddens,
+                tts_pad_embed,
+                talker_attention_mask,
+                temperature=temperature,
+            )
             
         elif "CustomVoice" in model:
-            async_gen = interface.generate_custom_voice_async(text=text, language=language, speaker=speaker)
+            async_gen = interface.generate_custom_voice_async(
+                text=text,
+                language=language,
+                speaker=speaker,
+                temperature=temperature,
+            )
             
         elif "Base" in model:
             # 1. First, correct the `create_voice_clone_prompt` signature perfectly matching examples
@@ -285,7 +297,13 @@ async def audio_stream_generator_async(stream_id: str, request_data: dict):
                     
             loop = asyncio.get_event_loop()
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = await loop.run_in_executor(None, _prep_voice_clone)
-            async_gen = interface.generate_async(talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask)
+            async_gen = interface.generate_async(
+                talker_input_embeds,
+                trailing_text_hiddens,
+                tts_pad_embed,
+                talker_attention_mask,
+                temperature=temperature,
+            )
         else:
             return
 
@@ -403,6 +421,7 @@ async def prepare_stream(
     model: str = Form(...),
     text: str = Form(...),
     language: str = Form(...),
+    temperature: float = Form(0.9),
     instruction: str = Form(""),
     speaker: str = Form(""),
     ref_audio: UploadFile = File(None),
@@ -415,6 +434,8 @@ async def prepare_stream(
         await switch_model_if_needed(model)
     except HTTPException as e:
         raise e # Re-raise the HTTPException from switch_model_if_needed
+    if temperature <= 0:
+        raise HTTPException(status_code=400, detail="temperature must be > 0")
 
     stream_id = str(uuid.uuid4())
     
@@ -424,6 +445,7 @@ async def prepare_stream(
         "model": model,
         "text": text,
         "language": language,
+        "temperature": float(temperature),
         "instruction": instruction,
         "speaker": speaker,
         "cancel_event": asyncio.Event()
@@ -568,6 +590,9 @@ HTML_UI = """
                 <option value="Russian">Russian</option>
                 <option value="English">English</option>
             </select>
+            
+            <label>Temperature</label>
+            <input id="temperature" name="temperature" type="number" min="0.1" max="2.0" step="0.05" value="0.9">
 
             <label>Текст для озвучки</label>
             <textarea id="textInput" name="text" rows="4">Привет! Это потоковое воспроизведение через API. Вы начнете слышать звук еще до того, как весь этот длинный текст будет полностью сгенерирован нашей нейросетью. Это работает очень быстро и круто!</textarea>
@@ -675,6 +700,7 @@ HTML_UI = """
                 formData.append('model', document.getElementById('modelSelect').value);
                 formData.append('text', document.getElementById('textInput').value);
                 formData.append('language', document.getElementById('languageSelect').value);
+                formData.append('temperature', document.getElementById('temperature').value);
                 formData.append('instruction', document.getElementById('instruction').value);
                 formData.append('speaker', document.getElementById('speaker').value);
 

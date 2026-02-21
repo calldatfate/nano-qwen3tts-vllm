@@ -39,6 +39,22 @@ except ImportError:
 
 
 torch.manual_seed(42)
+DEFAULT_PREDICTOR_TEMPERATURE = 0.9
+
+
+def _validate_temperature(temperature: Optional[float]) -> float:
+    """Return a valid predictor temperature (>0) with default fallback."""
+    if temperature is None:
+        return DEFAULT_PREDICTOR_TEMPERATURE
+    try:
+        value = float(temperature)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("temperature must be a float value") from exc
+    if value <= 0.0:
+        raise ValueError("temperature must be > 0")
+    return value
+
+
 # Use Qwen3-TTS processor when available so tokenization matches Qwen3TTSModel.generate_custom_voice exactly
 def _get_processor(model_path: str):
     try:
@@ -527,6 +543,7 @@ class Qwen3TTSInterface:
         x_vector_only_mode: bool = False,
         voice_clone_prompt: Optional[Dict[str, Any]] = None,
         non_streaming_mode: bool = True,
+        temperature: float = DEFAULT_PREDICTOR_TEMPERATURE,
     ):
         """Generate speech using voice clone (yields codec chunks).
         
@@ -553,6 +570,7 @@ class Qwen3TTSInterface:
         
         if language is None:
             language = "Auto"
+        predictor_temperature = _validate_temperature(temperature)
         
         # Build or use voice_clone_prompt
         if voice_clone_prompt is None:
@@ -642,7 +660,7 @@ class Qwen3TTSInterface:
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
             str(uuid.uuid4()),
             SamplingParams(temperature=1.0, max_tokens=1),
-            SamplingParams(temperature=0.9, max_tokens=17),
+            SamplingParams(temperature=predictor_temperature, max_tokens=17),
         )
     
     def generate_voice_design(
@@ -651,6 +669,7 @@ class Qwen3TTSInterface:
         instruct: str,
         language: str = None,
         non_streaming_mode: bool = True,
+        temperature: float = DEFAULT_PREDICTOR_TEMPERATURE,
     ):
         """Generate speech with voice design (yields codec chunks).
         
@@ -681,6 +700,7 @@ class Qwen3TTSInterface:
         
         if language is None:
             language = "Auto"
+        predictor_temperature = _validate_temperature(temperature)
         
         # Prepare prompts - voice design doesn't use speakers, only instruct
         input_ids, instruct_ids, speakers, languages = prepare_custom_voice_prompt(
@@ -712,7 +732,7 @@ class Qwen3TTSInterface:
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
             str(uuid.uuid4()),
             SamplingParams(temperature=1.0, max_tokens=1),
-            SamplingParams(temperature=0.9, max_tokens=17),
+            SamplingParams(temperature=predictor_temperature, max_tokens=17),
         )
     
     async def start_zmq_tasks(self) -> None:
@@ -748,13 +768,20 @@ class Qwen3TTSInterface:
         self._zmq_tasks.clear()
         self._zmq_inbox = None
 
-    def generate_custom_voice(self, text: str, language: str = "English", speaker: str = "Vivian"):
+    def generate_custom_voice(
+        self,
+        text: str,
+        language: str = "English",
+        speaker: str = "Vivian",
+        temperature: float = DEFAULT_PREDICTOR_TEMPERATURE,
+    ):
         """Sync generator. Only valid when zmq_bridge is None. For ZMQ use generate_custom_voice_async()."""
         if self.zmq_bridge is not None:
             raise RuntimeError(
                 "When using ZMQ bridge, use async API: await interface.start_zmq_tasks(); "
                 "async for chunk in interface.generate_custom_voice_async(...)"
             )
+        predictor_temperature = _validate_temperature(temperature)
         input_ids, instruct_ids, speakers, languages = prepare_custom_voice_prompt(
             text=text, language=language, speaker=speaker,
             processor=self.processor, device=self.device,
@@ -770,15 +797,20 @@ class Qwen3TTSInterface:
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
             str(uuid.uuid4()),
             SamplingParams(temperature=1.0, max_tokens=1),
-            SamplingParams(temperature=0.9, max_tokens=17),
+            SamplingParams(temperature=predictor_temperature, max_tokens=17),
         )
 
     async def generate_custom_voice_async(
-        self, text: str, language: str = "English", speaker: str = "Vivian"
+        self,
+        text: str,
+        language: str = "English",
+        speaker: str = "Vivian",
+        temperature: float = DEFAULT_PREDICTOR_TEMPERATURE,
     ):
         """Async generator of codebook_id chunks. Requires zmq_bridge; call await start_zmq_tasks() first."""
         if self.zmq_bridge is None:
             raise RuntimeError("generate_custom_voice_async requires zmq_bridge")
+        predictor_temperature = _validate_temperature(temperature)
 
         def _prep_in_thread() -> tuple:
             """Run prep in executor so event loop can run engine_loop; lock serializes GPU prep."""
@@ -800,17 +832,30 @@ class Qwen3TTSInterface:
             None, _prep_in_thread
         )
         async for chunk in self.generate_async(
-            talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask
+            talker_input_embeds,
+            trailing_text_hiddens,
+            tts_pad_embed,
+            talker_attention_mask,
+            temperature=predictor_temperature,
         ):
             yield chunk
 
-    def generate(self, inputs_embeds: torch.Tensor, trailing_text_hiddens: torch.Tensor, tts_pad_embed: torch.Tensor, talker_attention_mask: torch.Tensor, request_id: str | None = None):
+    def generate(
+        self,
+        inputs_embeds: torch.Tensor,
+        trailing_text_hiddens: torch.Tensor,
+        tts_pad_embed: torch.Tensor,
+        talker_attention_mask: torch.Tensor,
+        request_id: str | None = None,
+        temperature: float = DEFAULT_PREDICTOR_TEMPERATURE,
+    ):
         """Sync generator. Only valid when zmq_bridge is None."""
         if self.zmq_bridge is not None:
             raise RuntimeError("When using ZMQ bridge use generate_async() after await start_zmq_tasks()")
+        predictor_temperature = _validate_temperature(temperature)
         request_id = request_id or str(uuid.uuid4())
         talker_sampling_params = SamplingParams(temperature=1.0, max_tokens=1)
-        predictor_sampling_params = SamplingParams(temperature=0.9, max_tokens=17)
+        predictor_sampling_params = SamplingParams(temperature=predictor_temperature, max_tokens=17)
         yield from self._generate_caller_driven(
             inputs_embeds, trailing_text_hiddens, tts_pad_embed,
             request_id, talker_sampling_params, predictor_sampling_params,
@@ -823,12 +868,14 @@ class Qwen3TTSInterface:
         tts_pad_embed: torch.Tensor,
         talker_attention_mask: torch.Tensor,
         request_id: str | None = None,
+        temperature: float = DEFAULT_PREDICTOR_TEMPERATURE,
     ):
         """Async generator of codebook_id chunks. ZMQ path; step() runs on event loop thread. Call await start_zmq_tasks() first."""
         if self.zmq_bridge is None:
             raise RuntimeError("generate_async requires zmq_bridge")
+        predictor_temperature = _validate_temperature(temperature)
         talker_sampling_params = SamplingParams(temperature=1.0, max_tokens=1)
-        predictor_sampling_params = SamplingParams(temperature=0.9, max_tokens=17)
+        predictor_sampling_params = SamplingParams(temperature=predictor_temperature, max_tokens=17)
         request_id = request_id or str(uuid.uuid4())
         request_queue: asyncio.Queue = asyncio.Queue()
         async with self._queues_lock:

@@ -73,6 +73,9 @@ The API supports 5 model variants, accessible via the `model` parameter:
 The streaming endpoint operates via a Producer-Consumer pattern. 
 Endpoint workflow: Send `POST /api/prepare` -> Receive `stream_id` -> Connect to `GET /api/stream/{stream_id}` to receive `audio/L16` PCM bytes iteratively.
 
+Common parameter:
+- `temperature` (float, default `0.9`, must be `> 0`) controls sampling randomness.
+
 ### Voice Clone (Zero-Shot)
 > Note: The `ref_text` parameter is optional. If omitted, the server automatically transcribes the reference audio on the GPU using `faster-whisper`.
 
@@ -81,6 +84,7 @@ curl -X POST "http://localhost:8000/api/prepare" \
   -F "model=Qwen/Qwen3-TTS-12Hz-0.6B-Base" \
   -F "text=Replace this with your desired output text." \
   -F "language=Russian" \
+  -F "temperature=0.9" \
   -F "ref_audio=@/path/to/your/reference.wav" 
 ```
 
@@ -90,6 +94,7 @@ curl -X POST "http://localhost:8000/api/prepare" \
   -F "model=Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign" \
   -F "text=Replace this with your desired output text." \
   -F "language=Russian" \
+  -F "temperature=0.9" \
   -F "instruction=Female voice, professional and calm tone"
 ```
 
@@ -99,6 +104,7 @@ curl -X POST "http://localhost:8000/api/prepare" \
   -F "model=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice" \
   -F "text=Replace this with your desired output text." \
   -F "language=Russian" \
+  -F "temperature=0.9" \
   -F "speaker=serena"
 ```
 
