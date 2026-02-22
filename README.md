@@ -10,8 +10,9 @@ Flash-Attention and Triton require a Linux environment. On Windows, this is achi
 
 ###  Native Linux (Ubuntu/Debian)
 ```bash
-# 1. Install prerequisites (SoX is required for audio processing)
-sudo apt update && sudo apt install -y sox libsox-dev
+# 1. Install prerequisites
+# SoX is used for audio processing; FFmpeg is required for robust audio decode/transcode
+sudo apt update && sudo apt install -y sox libsox-dev ffmpeg
 
 # 2. Create and activate a virtual environment
 python3 -m venv venv
@@ -27,7 +28,7 @@ pip install -r requirements.txt
 wsl
 
 # 2. Install prerequisites inside the Linux subsystem
-sudo apt update && sudo apt install -y sox libsox-dev
+sudo apt update && sudo apt install -y sox libsox-dev ffmpeg
 
 # 3. Create and activate a virtual environment
 python3 -m venv venv_wsl
@@ -36,6 +37,12 @@ source venv_wsl/bin/activate
 # 4. Install dependencies
 pip install -r requirements.txt
 ```
+
+### Verify FFmpeg
+```bash
+ffmpeg -version
+```
+If this command is missing, auto-transcription / audio decoding (for example with `faster-whisper`) may fail for some input formats.
 
 ---
 
