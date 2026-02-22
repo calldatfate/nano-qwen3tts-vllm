@@ -1,0 +1,35 @@
+services:
+  api:
+    build:
+      context: .
+    image: nano-qwen3tts-vllm:latest
+    container_name: nano-qwen3tts-api
+    command: python3 api_server.py
+    environment:
+      USE_ZMQ: "1"
+      HF_HOME: /root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    volumes:
+      - qwen3tts_hf_cache:/root/.cache/huggingface
+    gpus: all
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+    image: nano-qwen3tts-vllm:latest
+    container_name: nano-qwen3tts-web
+    command: python3 web_ui.py
+    environment:
+      USE_ZMQ: "0"
+      HF_HOME: /root/.cache/huggingface
+    ports:
+      - "7860:7860"
+    volumes:
+      - qwen3tts_hf_cache:/root/.cache/huggingface
+    gpus: all
+    restart: unless-stopped
+
+volumes:
+  qwen3tts_hf_cache:

@@ -8,7 +8,7 @@ Flash-Attention and Triton require a Linux environment. On Windows, this is achi
 
 ## 1. Installation
 
-###  Native Linux (Ubuntu/Debian)
+### Native Linux (Ubuntu/Debian)
 ```bash
 # 1. Install prerequisites
 # SoX is used for audio processing; FFmpeg is required for robust audio decode/transcode
@@ -20,6 +20,9 @@ source venv/bin/activate
 
 # 3. Install dependencies
 pip install -r requirements.txt
+
+# 4. Install this repo as a local package
+pip install -e .
 ```
 
 ### Windows (via WSL2)
@@ -36,6 +39,9 @@ source venv_wsl/bin/activate
 
 # 4. Install dependencies
 pip install -r requirements.txt
+
+# 5. Install this repo as a local package
+pip install -e .
 ```
 
 ### Verify FFmpeg
@@ -46,7 +52,47 @@ If this command is missing, auto-transcription / audio decoding (for example wit
 
 ---
 
-## 2. Execution
+## 2. Docker Run
+
+### Requirements
+- Docker Engine or Docker Desktop
+- NVIDIA GPU + NVIDIA Container Toolkit (for `--gpus all`)
+
+### Build image
+```bash
+docker build -t nano-qwen3tts-vllm .
+```
+
+### Run REST API
+```bash
+docker run --rm -it \
+  --gpus all \
+  -p 8000:8000 \
+  -e USE_ZMQ=1 \
+  -v qwen3tts_hf_cache:/root/.cache/huggingface \
+  nano-qwen3tts-vllm
+```
+
+### Run Web UI
+```bash
+docker run --rm -it \
+  --gpus all \
+  -p 7860:7860 \
+  -e USE_ZMQ=0 \
+  -v qwen3tts_hf_cache:/root/.cache/huggingface \
+  nano-qwen3tts-vllm python3 web_ui.py
+```
+
+### Run with Docker Compose
+```bash
+docker compose up api
+# or
+docker compose up web
+```
+
+---
+
+## 3. Execution (without Docker)
 
 Once the environment is active, choose your preferred interface:
 
@@ -66,18 +112,58 @@ python api_server.py
 
 ---
 
-## 3. Supported Models
+## 4. Base Voice Cloning Reference Audio Formats
 
-The API supports 5 model variants, accessible via the `model` parameter:
-* **Voice Design models** (`1.7B`): Generates voice characteristics strictly from textual descriptions.
-* **Custom Voice models** (`0.6B`, `1.7B`): Utilizes pre-trained, high-quality speaker embeddings.
-* **Base models** (`0.6B`, `1.7B`): Full zero-shot Voice Cloning from a provided reference audio snippet.
+For `Base` models, `ref_audio` is decoded with `soundfile` in the API path. In this repository's tested WSL runtime (`soundfile 0.13.1`), the following container formats are available:
+
+- `AIFF`
+- `AU`
+- `AVR`
+- `CAF`
+- `FLAC`
+- `HTK`
+- `IRCAM`
+- `MAT4`
+- `MAT5`
+- `MP3`
+- `MPC2K`
+- `NIST`
+- `OGG`
+- `PAF`
+- `PVF`
+- `RAW`
+- `RF64`
+- `SD2`
+- `SDS`
+- `SVX`
+- `VOC`
+- `W64`
+- `WAV`
+- `WAVEX`
+- `WVE`
+- `XI`
+
+In practice, `WAV` is the most reliable choice for voice cloning samples. `MP3`, `FLAC`, and `OGG` are also supported in the tested setup.
+
+To check formats in your own environment:
+```bash
+python -c "import soundfile as sf; print(sf.__version__); print(sorted(sf.available_formats().keys()))"
+```
 
 ---
 
-## 4. Streaming API Reference (cURL)
+## 5. Supported Models
 
-The streaming endpoint operates via a Producer-Consumer pattern. 
+The API supports 5 model variants, accessible via the `model` parameter:
+- **Voice Design models** (`1.7B`): Generates voice characteristics strictly from textual descriptions.
+- **Custom Voice models** (`0.6B`, `1.7B`): Utilizes pre-trained, high-quality speaker embeddings.
+- **Base models** (`0.6B`, `1.7B`): Full zero-shot Voice Cloning from a provided reference audio snippet.
+
+---
+
+## 6. Streaming API Reference (cURL)
+
+The streaming endpoint operates via a Producer-Consumer pattern.
 Endpoint workflow: Send `POST /api/prepare` -> Receive `stream_id` -> Connect to `GET /api/stream/{stream_id}` to receive `audio/L16` PCM bytes iteratively.
 
 Common parameter:
@@ -92,7 +178,7 @@ curl -X POST "http://localhost:8000/api/prepare" \
   -F "text=Replace this with your desired output text." \
   -F "language=Russian" \
   -F "temperature=0.9" \
-  -F "ref_audio=@/path/to/your/reference.wav" 
+  -F "ref_audio=@/path/to/your/reference.wav"
 ```
 
 ### Voice Design (Natural Language Instructions)
@@ -117,7 +203,7 @@ curl -X POST "http://localhost:8000/api/prepare" \
 
 ---
 
-## 5. Text Normalization
+## 7. Text Normalization
 
 TTS architectures parse phonemes sequentially. Raw digits (e.g., "1945", "$5.00") or complex abbreviations may result in mispronunciations or silence.
 
