@@ -3,6 +3,7 @@ import struct
 import numpy as np
 import gc
 import uuid
+from collections import deque
 import torch
 import soundfile as sf
 import traceback
@@ -37,8 +38,32 @@ ENFORCE_EAGER = False
 # Global lock for safe decoding across async requests
 decode_lock = threading.Lock()
 
-# Store active generators and cancellation events for streaming
+# Serialize model switch/load so concurrent requests do not race.
+model_switch_lock = asyncio.Lock()
+
+# Stream registry:
+# stream_id -> {
+#   "tenant_id": str,
+#   "request_data": dict,
+#   "state": "queued|running|finished|cancelled|failed",
+#   "stream_requested": bool,
+#   "error": Optional[str],
+#   "created_at": float,
+#   "started_at": Optional[float],
+#   "finished_at": Optional[float]
+# }
 active_streams = {}
+
+# Fair queue over tenants (single generation slot).
+tenant_queues = {}  # tenant_id -> deque[stream_id]
+tenant_rr = deque()  # round-robin ring of tenant_ids
+tenant_rr_set = set()
+queue_condition = asyncio.Condition()
+active_stream_id = None
+
+MAX_QUEUE_PER_TENANT = int(os.environ.get("MAX_QUEUE_PER_TENANT", "20"))
+MAX_TOTAL_QUEUED = int(os.environ.get("MAX_TOTAL_QUEUED", "200"))
+STREAM_WAIT_TIMEOUT_SEC = float(os.environ.get("STREAM_WAIT_TIMEOUT_SEC", "0"))
 
 def load_model(model_name):
     global interface, _tokenizer, USE_ZMQ, _zmq_bridge, current_model_name
@@ -190,9 +215,150 @@ def generate_wav_header(sample_rate: int, num_channels: int = 1, bit_depth: int 
     header += struct.pack('<I', 0xFFFFFFFF) # Subchunk2Size (unknown)
     return header
 
+
+def _normalize_tenant_id(tenant_id: str, channel_name: str) -> str:
+    tenant = (tenant_id or "").strip()
+    if tenant:
+        return tenant
+    channel = (channel_name or "").strip()
+    if channel:
+        return f"channel:{channel.lower()}"
+    return "default"
+
+
+def _queued_total_locked() -> int:
+    return sum(len(q) for q in tenant_queues.values())
+
+
+def _remove_tenant_from_rr_locked(tenant_id: str) -> None:
+    if tenant_id in tenant_rr_set:
+        tenant_rr_set.discard(tenant_id)
+        try:
+            tenant_rr.remove(tenant_id)
+        except ValueError:
+            pass
+
+
+def _prune_tenant_head_locked(tenant_id: str):
+    queue = tenant_queues.get(tenant_id)
+    if queue is None:
+        return None
+    while queue:
+        stream_id = queue[0]
+        job = active_streams.get(stream_id)
+        if job is None or job.get("state") != "queued":
+            queue.popleft()
+            continue
+        return job
+    tenant_queues.pop(tenant_id, None)
+    _remove_tenant_from_rr_locked(tenant_id)
+    return None
+
+
+def _pop_next_ready_stream_locked():
+    tenants_count = len(tenant_rr)
+    for _ in range(tenants_count):
+        tenant_id = tenant_rr.popleft()
+        head_job = _prune_tenant_head_locked(tenant_id)
+        if head_job is None:
+            continue
+
+        if not head_job.get("stream_requested", False):
+            tenant_rr.append(tenant_id)
+            continue
+
+        stream_id = tenant_queues[tenant_id].popleft()
+        head_after = _prune_tenant_head_locked(tenant_id)
+        if head_after is not None:
+            tenant_rr.append(tenant_id)
+        return stream_id
+    return None
+
+
+def _try_activate_next_locked():
+    global active_stream_id
+    if active_stream_id is not None:
+        return None
+
+    next_stream_id = _pop_next_ready_stream_locked()
+    if next_stream_id is None:
+        return None
+
+    job = active_streams.get(next_stream_id)
+    if job is None:
+        return None
+
+    job["state"] = "running"
+    job["started_at"] = time.time()
+    active_stream_id = next_stream_id
+    return next_stream_id
+
+
+async def _wait_until_stream_can_run(stream_id: str):
+    deadline = None
+    if STREAM_WAIT_TIMEOUT_SEC > 0:
+        deadline = time.monotonic() + STREAM_WAIT_TIMEOUT_SEC
+
+    async with queue_condition:
+        job = active_streams.get(stream_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Stream ID not found")
+        if job.get("state") == "queued":
+            job["stream_requested"] = True
+
+        while True:
+            job = active_streams.get(stream_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Stream ID not found")
+
+            state = job.get("state")
+            if state == "running" and active_stream_id == stream_id:
+                return job
+            if state == "cancelled":
+                raise HTTPException(status_code=409, detail="Stream was cancelled")
+            if state == "failed":
+                raise HTTPException(status_code=500, detail=job.get("error", "Stream failed"))
+            if state == "finished":
+                raise HTTPException(status_code=410, detail="Stream already finished")
+
+            _try_activate_next_locked()
+            if job.get("state") == "running" and active_stream_id == stream_id:
+                return job
+
+            timeout = None
+            if deadline is not None:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise HTTPException(status_code=408, detail="Timed out waiting in queue")
+
+            try:
+                await asyncio.wait_for(queue_condition.wait(), timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                raise HTTPException(status_code=408, detail="Timed out waiting in queue") from exc
+
+
+async def _mark_stream_done(stream_id: str, final_state: str, error: str | None = None):
+    global active_stream_id
+    async with queue_condition:
+        job = active_streams.get(stream_id)
+        if job is not None:
+            if job.get("state") not in {"cancelled", "failed"}:
+                job["state"] = final_state
+            job["finished_at"] = time.time()
+            if error:
+                job["error"] = error
+
+        if active_stream_id == stream_id:
+            active_stream_id = None
+
+        _try_activate_next_locked()
+        queue_condition.notify_all()
+
 async def audio_stream_generator_async(stream_id: str, request_data: dict):
     """Generator that leverages ZMQ async generator, decodes natively, and yields PCM bytes."""
     global interface
+    final_state = "finished"
+    final_error = None
     
     # Send WAV header first (24000 Hz, Mono, 16-bit PCM)
     yield generate_wav_header(24000, 1, 16)
@@ -409,12 +575,16 @@ async def audio_stream_generator_async(stream_id: str, request_data: dict):
                 print(f"[STREAM {stream_id[:8]}] Error awaiting producer task: {e}")
 
     except Exception as e:
+        final_state = "failed"
+        final_error = str(e)
         print(f"Streaming error: {e}")
         traceback.print_exc()
 
     finally:
-        if stream_id in active_streams:
-            del active_streams[stream_id]
+        cancel_event = request_data.get("cancel_event")
+        if final_state != "failed" and cancel_event is not None and cancel_event.is_set():
+            final_state = "cancelled"
+        await _mark_stream_done(stream_id, final_state=final_state, error=final_error)
 
 @app.post("/api/prepare")
 async def prepare_stream(
@@ -425,21 +595,21 @@ async def prepare_stream(
     instruction: str = Form(""),
     speaker: str = Form(""),
     ref_audio: UploadFile = File(None),
-    ref_text: str = Form("")
+    ref_text: str = Form(""),
+    tenant_id: str = Form(""),
+    channel_name: str = Form(""),
+    author: str = Form(""),
+    user_id: str = Form(""),
 ):
     """
-    Endpoint 1: Receives form data and initializes the model.
+    Endpoint 1: Receives form data and enqueues a stream request.
     """
-    try:
-        await switch_model_if_needed(model)
-    except HTTPException as e:
-        raise e # Re-raise the HTTPException from switch_model_if_needed
     if temperature <= 0:
         raise HTTPException(status_code=400, detail="temperature must be > 0")
 
     stream_id = str(uuid.uuid4())
-    
-# We delay the generator creation to the GET request because async generation 
+
+    # We delay the generator creation to the GET request because async generation
     # must be instantiated inside the same event loop task the StreamingResponse consumes it from.
     request_data = {
         "model": model,
@@ -448,7 +618,10 @@ async def prepare_stream(
         "temperature": float(temperature),
         "instruction": instruction,
         "speaker": speaker,
-        "cancel_event": asyncio.Event()
+        "cancel_event": asyncio.Event(),
+        "channel_name": channel_name,
+        "author": author,
+        "user_id": user_id,
     }
     
     if "Base" in model:
@@ -491,31 +664,136 @@ async def prepare_stream(
         else:
             request_data["ref_text"] = ref_text
 
-    active_streams[stream_id] = request_data
-    return {"stream_id": stream_id, "message": "Ready to stream"}
+    tenant_key = _normalize_tenant_id(tenant_id, channel_name)
+
+    async with queue_condition:
+        if _queued_total_locked() >= MAX_TOTAL_QUEUED:
+            raise HTTPException(status_code=429, detail=f"Queue is full (MAX_TOTAL_QUEUED={MAX_TOTAL_QUEUED})")
+
+        tenant_queue = tenant_queues.get(tenant_key)
+        if tenant_queue is None:
+            tenant_queue = deque()
+            tenant_queues[tenant_key] = tenant_queue
+
+        if len(tenant_queue) >= MAX_QUEUE_PER_TENANT:
+            raise HTTPException(status_code=429, detail=f"Tenant queue is full (MAX_QUEUE_PER_TENANT={MAX_QUEUE_PER_TENANT})")
+
+        active_streams[stream_id] = {
+            "tenant_id": tenant_key,
+            "request_data": request_data,
+            "state": "queued",
+            "stream_requested": False,
+            "stream_opened": False,
+            "error": None,
+            "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+        }
+        tenant_queue.append(stream_id)
+
+        if tenant_key not in tenant_rr_set:
+            tenant_rr.append(tenant_key)
+            tenant_rr_set.add(tenant_key)
+
+        queue_condition.notify_all()
+
+        return {
+            "stream_id": stream_id,
+            "tenant_id": tenant_key,
+            "state": "queued",
+            "tenant_queue_depth": len(tenant_queue),
+            "global_queue_depth": _queued_total_locked(),
+            "message": "Queued. Connect GET /api/stream/{stream_id} and wait for your fair turn.",
+        }
 
 @app.get("/api/stream/{stream_id}")
 async def stream_tts(stream_id: str):
     """
-    Endpoint 2: Client connects via GET stream endpoint (or <audio src="...">) to receive raw audio chunks.
+    Endpoint 2: Client connects via GET stream endpoint and waits fair queue turn.
     """
-    if stream_id not in active_streams:
-        raise HTTPException(status_code=404, detail="Stream ID not found or already consumed")
-        
-    request_data = active_streams[stream_id]
+    job = await _wait_until_stream_can_run(stream_id)
+    request_data = job["request_data"]
+
+    try:
+        async with model_switch_lock:
+            await switch_model_if_needed(request_data["model"])
+    except HTTPException as e:
+        await _mark_stream_done(stream_id, final_state="failed", error=str(e.detail))
+        raise e
+    except Exception as e:
+        await _mark_stream_done(stream_id, final_state="failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to load model for stream: {e}")
+
+    async with queue_condition:
+        if job.get("stream_opened"):
+            raise HTTPException(status_code=409, detail="Stream already consumed")
+        job["stream_opened"] = True
+
     return StreamingResponse(audio_stream_generator_async(stream_id, request_data), media_type="audio/wav")
+
+
+@app.get("/api/status/{stream_id}")
+async def stream_status(stream_id: str):
+    """
+    Endpoint 2.5: Poll queue/execution status.
+    """
+    async with queue_condition:
+        job = active_streams.get(stream_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Stream ID not found")
+        tenant_id = job["tenant_id"]
+        tenant_queue_depth = len(tenant_queues.get(tenant_id, ()))
+        return {
+            "stream_id": stream_id,
+            "tenant_id": tenant_id,
+            "state": job.get("state"),
+            "active_stream_id": active_stream_id,
+            "tenant_queue_depth": tenant_queue_depth,
+            "global_queue_depth": _queued_total_locked(),
+            "created_at": job.get("created_at"),
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+            "error": job.get("error"),
+        }
 
 @app.post("/api/cancel/{stream_id}")
 async def cancel_stream(stream_id: str):
     """
-    Endpoint 3: Cancel an ongoing stream.
+    Endpoint 3: Cancel queued or ongoing stream.
     """
-    if stream_id in active_streams:
-        request_data = active_streams[stream_id]
-        if "cancel_event" in request_data:
-            request_data["cancel_event"].set()
-            return {"message": "Stream cancellation requested"}
-    return {"message": "Stream not found or already cancelled"}
+    async with queue_condition:
+        job = active_streams.get(stream_id)
+        if job is None:
+            return {"message": "Stream not found or already cancelled"}
+
+        request_data = job.get("request_data", {})
+        cancel_event = request_data.get("cancel_event")
+        if cancel_event is not None:
+            cancel_event.set()
+
+        state = job.get("state")
+        if state == "queued":
+            tenant_id = job["tenant_id"]
+            queue = tenant_queues.get(tenant_id)
+            if queue is not None:
+                try:
+                    queue.remove(stream_id)
+                except ValueError:
+                    pass
+                if not queue:
+                    tenant_queues.pop(tenant_id, None)
+                    _remove_tenant_from_rr_locked(tenant_id)
+            job["state"] = "cancelled"
+            job["finished_at"] = time.time()
+            _try_activate_next_locked()
+            queue_condition.notify_all()
+            return {"message": "Queued stream cancelled", "state": "cancelled"}
+
+        if state == "running":
+            queue_condition.notify_all()
+            return {"message": "Stream cancellation requested", "state": "running"}
+
+        return {"message": "Stream already completed", "state": state}
 
 
 HTML_UI = """

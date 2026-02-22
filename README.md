@@ -104,7 +104,7 @@ python web_ui.py
 ```
 
 ### Option B: REST API (FastAPI)
-Production-ready backend for synchronous and asynchronous audio streaming via ZeroMQ.
+Production-ready backend for asynchronous audio streaming via ZeroMQ with fair tenant queue scheduling.
 ```bash
 python api_server.py
 # Access demo player and API schemas at: http://127.0.0.1:8000
@@ -163,43 +163,90 @@ The API supports 5 model variants, accessible via the `model` parameter:
 
 ## 6. Streaming API Reference (cURL)
 
-The streaming endpoint operates via a Producer-Consumer pattern.
-Endpoint workflow: Send `POST /api/prepare` -> Receive `stream_id` -> Connect to `GET /api/stream/{stream_id}` to receive `audio/L16` PCM bytes iteratively.
+The API is now optimized for multi-tenant chat pipelines with a single generation engine and a fair queue.
+Scheduling is round-robin by tenant, not plain FIFO by request.
 
-Common parameter:
-- `temperature` (float, default `0.9`, must be `> 0`) controls sampling randomness.
+Workflow:
+1. `POST /api/prepare` to enqueue a request.
+2. (Optional) `GET /api/status/{stream_id}` to poll queue/execution state.
+3. `GET /api/stream/{stream_id}` to wait for turn and receive streamed WAV bytes.
+4. `POST /api/cancel/{stream_id}` to cancel queued/running requests.
 
-### Voice Clone (Zero-Shot)
-> Note: The `ref_text` parameter is optional. If omitted, the server automatically transcribes the reference audio on the GPU using `faster-whisper`.
+### Tenant Identity (important)
 
-```bash
-curl -X POST "http://localhost:8000/api/prepare" \
-  -F "model=Qwen/Qwen3-TTS-12Hz-0.6B-Base" \
-  -F "text=Replace this with your desired output text." \
-  -F "language=Russian" \
-  -F "temperature=0.9" \
-  -F "ref_audio=@/path/to/your/reference.wav"
-```
+Use `tenant_id` as the fairness key (for example `twitch:<broadcaster_id>`).
+If `tenant_id` is not provided, server falls back to `channel_name` (`channel:<name>`), then `default`.
 
-### Voice Design (Natural Language Instructions)
-```bash
-curl -X POST "http://localhost:8000/api/prepare" \
-  -F "model=Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign" \
-  -F "text=Replace this with your desired output text." \
-  -F "language=Russian" \
-  -F "temperature=0.9" \
-  -F "instruction=Female voice, professional and calm tone"
-```
+### Request Fields
 
-### Custom Voice (Pre-trained Speakers)
+Required:
+- `model`
+- `text`
+- `language`
+
+Optional:
+- `temperature` (float, default `0.9`, must be `> 0`)
+- `instruction` (VoiceDesign)
+- `speaker` (CustomVoice)
+- `ref_audio` + optional `ref_text` (Base)
+- `tenant_id`
+- `channel_name`
+- `author`
+- `user_id`
+
+### Queue Limits (env vars)
+
+- `MAX_QUEUE_PER_TENANT` (default `20`)
+- `MAX_TOTAL_QUEUED` (default `200`)
+- `STREAM_WAIT_TIMEOUT_SEC` (default `0`, disabled)
+
+### Example: Enqueue (CustomVoice)
+
 ```bash
 curl -X POST "http://localhost:8000/api/prepare" \
   -F "model=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice" \
   -F "text=Replace this with your desired output text." \
   -F "language=Russian" \
   -F "temperature=0.9" \
-  -F "speaker=serena"
+  -F "speaker=serena" \
+  -F "tenant_id=twitch:12345678" \
+  -F "channel_name=my_streamer_channel" \
+  -F "author=chat_user" \
+  -F "user_id=987654321"
 ```
+
+Response (example):
+```json
+{
+  "stream_id": "7c4e1c2b-...-a6d5",
+  "tenant_id": "twitch:12345678",
+  "state": "queued",
+  "tenant_queue_depth": 2,
+  "global_queue_depth": 15
+}
+```
+
+### Example: Poll Status
+
+```bash
+curl "http://localhost:8000/api/status/<stream_id>"
+```
+
+### Example: Stream Audio
+
+```bash
+curl -L "http://localhost:8000/api/stream/<stream_id>" --output out.wav
+```
+
+### Example: Cancel
+
+```bash
+curl -X POST "http://localhost:8000/api/cancel/<stream_id>"
+```
+
+### Voice Clone (Base) note
+
+`ref_text` is optional. If omitted, server tries auto-transcription using `faster-whisper`.
 
 ---
 
