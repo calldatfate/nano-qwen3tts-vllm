@@ -2,34 +2,58 @@ services:
   api:
     build:
       context: .
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+        TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-8.6}
+        FLASH_ATTN_MAX_JOBS: ${FLASH_ATTN_MAX_JOBS:-1}
+        FLASH_ATTN_NVCC_THREADS: ${FLASH_ATTN_NVCC_THREADS:-1}
+        FLASH_ATTN_VERSION: ${FLASH_ATTN_VERSION:-2.8.3}
+        FLASH_ATTN_ALLOW_SOURCE_BUILD: ${FLASH_ATTN_ALLOW_SOURCE_BUILD:-0}
     image: nano-qwen3tts-vllm:latest
     container_name: nano-qwen3tts-api
-    command: python3 api_server.py
+    command: python api_server.py
     environment:
       USE_ZMQ: "1"
       HF_HOME: /root/.cache/huggingface
+      QWEN_TTS_PORT: "8012"
+      QWEN_VOICE_STORAGE_DIR: /app/runtime/qwen_voices
+      QWEN3_TTS_MODEL_PATH: ${QWEN3_TTS_MODEL_PATH:-}
+      QWEN_TTS_ALLOWED_MODELS: ${QWEN_TTS_ALLOWED_MODELS:-}
     ports:
-      - "8000:8000"
+      - "8012:8012"
     volumes:
       - qwen3tts_hf_cache:/root/.cache/huggingface
+      - qwen3tts_voice_storage:/app/runtime/qwen_voices
     gpus: all
     restart: unless-stopped
 
   web:
     build:
       context: .
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+        TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-8.6}
+        FLASH_ATTN_MAX_JOBS: ${FLASH_ATTN_MAX_JOBS:-1}
+        FLASH_ATTN_NVCC_THREADS: ${FLASH_ATTN_NVCC_THREADS:-1}
+        FLASH_ATTN_VERSION: ${FLASH_ATTN_VERSION:-2.8.3}
+        FLASH_ATTN_ALLOW_SOURCE_BUILD: ${FLASH_ATTN_ALLOW_SOURCE_BUILD:-0}
     image: nano-qwen3tts-vllm:latest
     container_name: nano-qwen3tts-web
-    command: python3 web_ui.py
+    command: python web_ui.py
     environment:
       USE_ZMQ: "0"
       HF_HOME: /root/.cache/huggingface
+      QWEN_VOICE_STORAGE_DIR: /app/runtime/qwen_voices
+      QWEN3_TTS_MODEL_PATH: ${QWEN3_TTS_MODEL_PATH:-}
+      QWEN_TTS_ALLOWED_MODELS: ${QWEN_TTS_ALLOWED_MODELS:-}
     ports:
       - "7860:7860"
     volumes:
       - qwen3tts_hf_cache:/root/.cache/huggingface
+      - qwen3tts_voice_storage:/app/runtime/qwen_voices
     gpus: all
     restart: unless-stopped
 
 volumes:
   qwen3tts_hf_cache:
+  qwen3tts_voice_storage:

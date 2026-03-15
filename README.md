@@ -19,7 +19,9 @@ python3 -m venv venv
 source venv/bin/activate
 
 # 3. Install dependencies
+pip install --upgrade pip setuptools wheel packaging ninja
 pip install -r requirements.txt
+pip install --no-build-isolation flash-attn
 
 # 4. Install this repo as a local package
 pip install -e .
@@ -38,7 +40,9 @@ python3 -m venv venv_wsl
 source venv_wsl/bin/activate
 
 # 4. Install dependencies
+pip install --upgrade pip setuptools wheel packaging ninja
 pip install -r requirements.txt
+pip install --no-build-isolation flash-attn
 
 # 5. Install this repo as a local package
 pip install -e .
@@ -63,11 +67,65 @@ If this command is missing, auto-transcription / audio decoding (for example wit
 docker build -t nano-qwen3tts-vllm .
 ```
 
+The Docker image keeps the CUDA 12.4.1 Ubuntu 22.04 base, but installs a managed
+`Python 3.12` runtime with `uv` on top so the Docker pipeline matches modern
+project environments without depending on the distro's system Python.
+
+The Docker image compiles `flash-attn` during build. The first build is therefore
+noticeably slower than a plain Python image build and requires the CUDA `devel`
+toolchain inside the container.
+
+To make the build more stable on Docker Desktop / constrained RAM setups, the
+Dockerfile limits `flash-attn` build parallelism by default (`MAX_JOBS=1`,
+`NVCC_THREADS=1`).
+
+During Docker build, the image first resolves the exact prebuilt `flash-attn`
+wheel URL from the current Python / Torch ABI. If that wheel is unavailable,
+the build fails fast by default instead of silently spending a long time on a
+source build. Set `FLASH_ATTN_ALLOW_SOURCE_BUILD=1` only if you explicitly want
+to allow the slow source-build fallback.
+
+Docker also applies a dedicated constraints file so `qwen-tts` does not
+silently pull a newer `torch` version for which no compatible prebuilt
+`flash-attn` wheel exists.
+
+By default, the Dockerfile targets Ampere (`TORCH_CUDA_ARCH_LIST=8.6`), which
+matches RTX 3080-class GPUs. Override it for other GPUs if needed:
+
+```bash
+docker build \
+  --build-arg PYTHON_VERSION=3.12 \
+  --build-arg TORCH_CUDA_ARCH_LIST=8.9 \
+  -t nano-qwen3tts-vllm .
+```
+
+You can also override `flash-attn` build parallelism if your machine has more RAM:
+
+```bash
+docker build \
+  --build-arg PYTHON_VERSION=3.12 \
+  --build-arg TORCH_CUDA_ARCH_LIST=8.6 \
+  --build-arg FLASH_ATTN_MAX_JOBS=2 \
+  --build-arg FLASH_ATTN_NVCC_THREADS=2 \
+  -t nano-qwen3tts-vllm .
+```
+
+If you intentionally want to allow source compilation when no prebuilt wheel is
+available:
+
+```bash
+docker build \
+  --build-arg PYTHON_VERSION=3.12 \
+  --build-arg FLASH_ATTN_ALLOW_SOURCE_BUILD=1 \
+  -t nano-qwen3tts-vllm .
+```
+
 ### Run REST API
 ```bash
 docker run --rm -it \
   --gpus all \
-  -p 8000:8000 \
+  -p 8012:8012 \
+  -e QWEN_TTS_PORT=8012 \
   -e USE_ZMQ=1 \
   -v qwen3tts_hf_cache:/root/.cache/huggingface \
   nano-qwen3tts-vllm
@@ -90,6 +148,10 @@ docker compose up api
 docker compose up web
 ```
 
+For non-Ampere GPUs, export a matching `TORCH_CUDA_ARCH_LIST` before compose build/run.
+You may also raise `FLASH_ATTN_MAX_JOBS` / `FLASH_ATTN_NVCC_THREADS` if Docker has enough RAM,
+or set `FLASH_ATTN_ALLOW_SOURCE_BUILD=1` if you explicitly want the slow source-build fallback.
+
 ---
 
 ## 3. Execution (without Docker)
@@ -107,7 +169,14 @@ python web_ui.py
 Production-ready backend for asynchronous audio streaming via ZeroMQ with fair tenant queue scheduling.
 ```bash
 python api_server.py
-# Access demo player and API schemas at: http://127.0.0.1:8000
+# Access demo player and API schemas at: http://127.0.0.1:8012
+```
+
+The API also exposes lightweight health endpoints:
+
+```bash
+curl http://127.0.0.1:8012/health/live
+curl http://127.0.0.1:8012/health/ready
 ```
 
 ---
@@ -159,6 +228,19 @@ The API supports 5 model variants, accessible via the `model` parameter:
 - **Custom Voice models** (`0.6B`, `1.7B`): Utilizes pre-trained, high-quality speaker embeddings.
 - **Base models** (`0.6B`, `1.7B`): Full zero-shot Voice Cloning from a provided reference audio snippet.
 
+### Runtime model policy
+
+By default the worker can expose the full catalog above. For production deployments it is usually better to expose only the model you actually run:
+
+- `QWEN3_TTS_MODEL_PATH=<exact model id or local path>`
+  - exposes a single runtime model via `/api/models`
+- `QWEN_TTS_ALLOWED_MODELS=base`
+  - exposes only the requested family
+- `QWEN_TTS_ALLOWED_MODELS=Qwen/Qwen3-TTS-12Hz-0.6B-Base,Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`
+  - exposes only the listed exact models
+
+Keep `QWEN_VOICE_STORAGE_DIR` on a persistent shared volume. Stored voice samples survive runtime restarts and become usable again when a `Base` runtime is brought back online.
+
 ---
 
 ## 6. Streaming API Reference (cURL)
@@ -203,7 +285,7 @@ Optional:
 ### Example: Enqueue (CustomVoice)
 
 ```bash
-curl -X POST "http://localhost:8000/api/prepare" \
+curl -X POST "http://localhost:8012/api/prepare" \
   -F "model=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice" \
   -F "text=Replace this with your desired output text." \
   -F "language=Russian" \
@@ -229,19 +311,19 @@ Response (example):
 ### Example: Poll Status
 
 ```bash
-curl "http://localhost:8000/api/status/<stream_id>"
+curl "http://localhost:8012/api/status/<stream_id>"
 ```
 
 ### Example: Stream Audio
 
 ```bash
-curl -L "http://localhost:8000/api/stream/<stream_id>" --output out.wav
+curl -L "http://localhost:8012/api/stream/<stream_id>" --output out.wav
 ```
 
 ### Example: Cancel
 
 ```bash
-curl -X POST "http://localhost:8000/api/cancel/<stream_id>"
+curl -X POST "http://localhost:8012/api/cancel/<stream_id>"
 ```
 
 ### Voice Clone (Base) note

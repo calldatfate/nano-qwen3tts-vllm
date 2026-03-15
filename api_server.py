@@ -1,4 +1,6 @@
-import io
+﻿import io
+import json
+import mimetypes
 import struct
 import numpy as np
 import gc
@@ -13,9 +15,11 @@ import time
 import threading
 import sys
 import argparse
+import tempfile
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, BackgroundTasks, Form, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import torch._dynamo
@@ -26,6 +30,18 @@ from nano_qwen3tts_vllm.zmq import ZMQOutputBridge
 from nano_qwen3tts_vllm.utils.speech_tokenizer_cudagraph import SpeechTokenizerCUDAGraph
 from nano_qwen3tts_vllm.utils.prompt import prepare_custom_voice_prompt, _tokenize_texts
 from nano_qwen3tts_vllm.utils.generation import prepare_inputs, generate_speaker_prompt, generate_icl_prompt
+from runtime_models import (
+    QWEN_MODEL_CATALOG,
+    build_runtime_model_catalog,
+    pick_runtime_model,
+)
+from voice_store import FileVoiceStore
+from voice_uploads import (
+    prepare_reference_audio_from_path,
+    prepare_uploaded_voice_file,
+    sanitize_voice_name,
+    transcribe_voice_file,
+)
 
 # Global state
 current_model_name = None
@@ -64,6 +80,40 @@ active_stream_id = None
 MAX_QUEUE_PER_TENANT = int(os.environ.get("MAX_QUEUE_PER_TENANT", "20"))
 MAX_TOTAL_QUEUED = int(os.environ.get("MAX_TOTAL_QUEUED", "200"))
 STREAM_WAIT_TIMEOUT_SEC = float(os.environ.get("STREAM_WAIT_TIMEOUT_SEC", "0"))
+SERVER_HOST = os.environ.get("QWEN_TTS_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("QWEN_TTS_PORT", os.environ.get("PORT", "8012")))
+VOICE_STORAGE_DIR = Path(os.environ.get("QWEN_VOICE_STORAGE_DIR", "./runtime/qwen_voices")).resolve()
+VOICE_FILES_DIR = VOICE_STORAGE_DIR / "files"
+VOICE_PREVIEW_DIR = VOICE_STORAGE_DIR / "previews"
+VOICE_STATE_PATH = VOICE_STORAGE_DIR / "state.json"
+
+
+def _runtime_configured_model() -> str | None:
+    candidate = str(os.environ.get("QWEN3_TTS_MODEL_PATH", "")).strip()
+    return candidate or None
+
+
+def _runtime_allowed_models_raw() -> str | None:
+    candidate = str(os.environ.get("QWEN_TTS_ALLOWED_MODELS", "")).strip()
+    return candidate or None
+
+
+def _runtime_model_catalog() -> list[dict[str, object]]:
+    return build_runtime_model_catalog(
+        configured_model=_runtime_configured_model(),
+        allowed_models_raw=_runtime_allowed_models_raw(),
+    )
+
+
+def _resolve_runtime_model(model_name: str | None, *, required_family: str | None = None) -> str:
+    try:
+        return pick_runtime_model(
+            requested_model=model_name,
+            runtime_catalog=_runtime_model_catalog(),
+            required_family=required_family,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 def load_model(model_name):
     global interface, _tokenizer, USE_ZMQ, _zmq_bridge, current_model_name
@@ -93,6 +143,29 @@ def load_model(model_name):
     )
     current_model_name = model_name
 
+
+def _dispose_loaded_model_state():
+    global interface, _zmq_bridge, _tokenizer, current_model_name
+
+    if interface is not None and hasattr(interface, "shutdown"):
+        interface.shutdown()
+
+    if _tokenizer is not None and hasattr(_tokenizer, "shutdown"):
+        _tokenizer.shutdown()
+
+    interface = None
+    _tokenizer = None
+    _zmq_bridge = None
+    current_model_name = None
+
+    torch._dynamo.reset()
+
+    for _ in range(3):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
 async def switch_model_if_needed(model_name: str):
     global current_model_name, interface, _zmq_bridge, USE_ZMQ, _tokenizer
     if interface is not None and current_model_name != model_name:
@@ -103,35 +176,14 @@ async def switch_model_if_needed(model_name: str):
             if hasattr(interface.zmq_bridge, 'context'):
                 interface.zmq_bridge.context.destroy(linger=0)
             interface.zmq_bridge.close()
-            
-        # Call shutdown BEFORE deleting to ensure LLMEngines invoke exit() and destroy CUDA Graphs
-        if hasattr(interface, 'shutdown'):
-            interface.shutdown()
-            
-        if _tokenizer is not None and hasattr(_tokenizer, 'shutdown'):
-            _tokenizer.shutdown()
-        
-        # Free GPU memory and reset torch Dynamo cache to prevent cache_size_limit crash
-        del interface
-        del _tokenizer
-        interface = None
-        _tokenizer = None
-        _zmq_bridge = None
-        
-        torch._dynamo.reset()
-        
-        for _ in range(3):
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-            
-        current_model_name = None
+
+        # Shutdown/model cleanup can take noticeable time and must not block the event loop.
+        await asyncio.to_thread(_dispose_loaded_model_state)
         
     if interface is None:
         print(f"\n🚀 Loading model (ZMQ Mode): {model_name}...")
         try:
-            load_model(model_name)
+            await asyncio.to_thread(load_model, model_name)
             if USE_ZMQ and hasattr(interface, 'zmq_bridge') and interface.zmq_bridge:
                 # Start background ZMQ loop (sync context)
                 loop = asyncio.get_event_loop()
@@ -144,6 +196,115 @@ async def switch_model_if_needed(model_name: str):
             err_msg = traceback.format_exc()
             print(f"Error loading model:\n{err_msg}")
             raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
+
+
+def _parse_optional_user_id(raw_value: object) -> int | None:
+    try:
+        value = int(str(raw_value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+async def _resolve_base_model_reference_voice(
+    app: FastAPI,
+    *,
+    user_id_raw: object,
+    requested_voice: str | None,
+) -> tuple[dict, np.ndarray, int]:
+    user_id = _parse_optional_user_id(user_id_raw)
+    voice_record = await app.state.voice_store.resolve_voice_record_for_user(user_id, requested_voice)
+    if voice_record is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Base model requires either ref_audio upload or a stored Qwen clone voice. "
+                "Upload a voice sample in Voice Management and select it before synthesis."
+            ),
+        )
+
+    file_path_raw = str(voice_record.get("file_path") or "").strip()
+    if not file_path_raw:
+        raise HTTPException(status_code=400, detail="Selected Qwen voice has no stored file_path")
+
+    voice_path = Path(file_path_raw).resolve()
+    if not voice_path.exists():
+        raise HTTPException(status_code=400, detail="Stored Qwen voice sample file is missing")
+
+    wav, sample_rate = await prepare_reference_audio_from_path(voice_path)
+    return voice_record, wav, sample_rate
+
+
+def _guess_audio_media_type(path: Path) -> str:
+    return mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+
+
+def _serialize_voice_record(voice: dict) -> dict:
+    payload = dict(voice)
+    payload["type"] = "global" if payload.get("voice_type") == "global" else "user"
+    payload["is_global"] = payload.get("voice_type") == "global"
+    return payload
+
+
+def _resolve_voice_file_path(app: FastAPI, voice: dict) -> Path:
+    file_path_raw = str(voice.get("file_path") or "").strip()
+    if not file_path_raw:
+        raise HTTPException(status_code=400, detail="Voice has no file_path")
+
+    voice_path = Path(file_path_raw).resolve()
+    try:
+        voice_path.relative_to(app.state.voice_files_dir.resolve())
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="Invalid voice file path") from error
+    return voice_path
+
+
+def _cleanup_voice_file(app: FastAPI, voice: dict) -> None:
+    file_path_raw = str(voice.get("file_path") or "").strip()
+    if not file_path_raw:
+        return
+    try:
+        voice_path = Path(file_path_raw).resolve()
+        voice_path.relative_to(app.state.voice_files_dir.resolve())
+        voice_path.unlink(missing_ok=True)
+    except Exception:
+        return
+
+
+async def _retranscribe_voice_record(request: Request, voice_id: int) -> dict[str, object]:
+    voice = await request.app.state.voice_store.get_voice_by_id(voice_id)
+    if not voice:
+        raise HTTPException(status_code=404, detail="Voice not found")
+
+    voice_path = _resolve_voice_file_path(request.app, voice)
+    try:
+        reference_text = await transcribe_voice_file(voice_path)
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+    updated = await request.app.state.voice_store.update_voice_settings(
+        voice_id,
+        {"reference_text": reference_text},
+    )
+    return {
+        "success": True,
+        "status": "success",
+        "voice": _serialize_voice_record(updated or voice),
+        "reference_text": reference_text,
+    }
+
+
+async def _admin_voice_groups(app: FastAPI) -> dict[str, object]:
+    voices = await app.state.voice_store.list_all_voices()
+    serialized = [_serialize_voice_record(voice) for voice in voices]
+    global_voices = [voice for voice in serialized if voice.get("voice_type") == "global"]
+    user_voices = [voice for voice in serialized if voice.get("voice_type") != "global"]
+    return {
+        "success": True,
+        "voices": serialized,
+        "global_voices": global_voices,
+        "user_voices": user_voices,
+    }
 
 def _resample_to_24k(wav: np.ndarray, orig_sr: int) -> np.ndarray:
     TARGET_SAMPLE_RATE = 24000
@@ -167,9 +328,17 @@ def _decode_batch(codes: list):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown logic"""
+    VOICE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    VOICE_FILES_DIR.mkdir(parents=True, exist_ok=True)
+    VOICE_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    app.state.voice_store = FileVoiceStore(VOICE_STATE_PATH, VOICE_FILES_DIR)
+    await app.state.voice_store.startup()
+    app.state.voice_files_dir = VOICE_FILES_DIR
+    app.state.voice_preview_dir = VOICE_PREVIEW_DIR
     yield
     # Cleanup on shutdown
     global interface, _zmq_bridge, USE_ZMQ
+    await app.state.voice_store.close()
     if interface is not None:
         if USE_ZMQ and hasattr(interface, 'zmq_bridge') and interface.zmq_bridge:
             await interface.stop_zmq_tasks()
@@ -177,6 +346,363 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Qwen3-TTS Streaming API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.get("/health/live")
+async def health_live():
+    return {
+        "status": "healthy",
+        "service": "nano-qwen3tts-vllm",
+        "current_model": current_model_name,
+    }
+
+
+@app.get("/health/ready")
+async def health_ready():
+    return {
+        "status": "healthy",
+        "service": "nano-qwen3tts-vllm",
+        "model_loaded": interface is not None,
+        "current_model": current_model_name,
+    }
+
+
+@app.get("/api/models")
+async def get_supported_models():
+    models = _runtime_model_catalog()
+    return {
+        "success": True,
+        "provider": "qwen",
+        "current_model": current_model_name,
+        "configured_model": _runtime_configured_model(),
+        "model_policy": "restricted" if _runtime_allowed_models_raw() or _runtime_configured_model() else "dynamic",
+        "models": models,
+    }
+
+
+@app.get("/api/audio/{filename}")
+async def get_generated_audio(filename: str):
+    preview_root = VOICE_PREVIEW_DIR.resolve()
+    target_path = (preview_root / filename).resolve()
+    try:
+        target_path.relative_to(preview_root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not target_path.exists():
+        raise HTTPException(status_code=404, detail="Audio not found")
+    return FileResponse(
+        target_path,
+        media_type=_guess_audio_media_type(target_path),
+        filename=target_path.name,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/tts/voices/global")
+async def voices_global(request: Request):
+    voices = await request.app.state.voice_store.list_global_voices()
+    return [_serialize_voice_record(voice) for voice in voices]
+
+
+@app.get("/api/tts/voices")
+async def voices_all(request: Request, user_id: int | None = None):
+    voices = await request.app.state.voice_store.list_available_voices(user_id=user_id)
+    return [_serialize_voice_record(voice) for voice in voices]
+
+
+@app.get("/api/tts/voices/{voice_id}")
+async def get_voice_info(request: Request, voice_id: int):
+    voice = await request.app.state.voice_store.get_voice_by_id(voice_id)
+    if not voice:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    return _serialize_voice_record(voice)
+
+
+@app.get("/api/tts/user/voices/{user_id}")
+async def user_voices(request: Request, user_id: int):
+    voices = await request.app.state.voice_store.list_user_voices(user_id)
+    return [_serialize_voice_record(voice) for voice in voices]
+
+
+@app.post("/api/tts/user/voices/upload")
+async def upload_user_voice(
+    request: Request,
+    file: UploadFile = File(...),
+    voice_name: str = Form(""),
+    name: str = Form(""),
+    user_id: int = Form(...),
+    reference_text: str = Form(""),
+    sample_text: str = Form(""),
+):
+    try:
+        clean_name = sanitize_voice_name(voice_name or name)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    all_voices = await request.app.state.voice_store.list_all_voices()
+    if any(
+        int(item.get("owner_id") or 0) == int(user_id)
+        and str(item.get("name") or "").strip().lower() == clean_name.lower()
+        for item in all_voices
+    ):
+        raise HTTPException(status_code=400, detail=f"Voice with name '{clean_name}' already exists")
+
+    try:
+        target_path, resolved_reference_text = await prepare_uploaded_voice_file(
+            voices_dir=request.app.state.voice_files_dir,
+            upload=file,
+            filename_prefix=f"user_{user_id}_{clean_name}",
+            reference_text=reference_text or sample_text or None,
+        )
+        voice = await request.app.state.voice_store.create_voice(
+            name=clean_name,
+            owner_id=int(user_id),
+            voice_type="user",
+            file_path=str(target_path),
+            is_public=False,
+            reference_text=resolved_reference_text or None,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    return {"success": True, "status": "success", "voice": voice}
+
+
+@app.delete("/api/tts/user/voices/{voice_id}")
+async def delete_user_voice(request: Request, voice_id: int, user_id: int):
+    voice = await request.app.state.voice_store.get_voice_by_id(voice_id)
+    if not voice or int(voice.get("owner_id") or 0) != int(user_id):
+        raise HTTPException(status_code=404, detail="Voice not found")
+
+    file_path_raw = str(voice.get("file_path") or "").strip()
+    await request.app.state.voice_store.delete_voice(voice_id)
+    if file_path_raw:
+        voice_path = Path(file_path_raw).resolve()
+        try:
+            voice_path.relative_to(request.app.state.voice_files_dir.resolve())
+            voice_path.unlink(missing_ok=True)
+        except ValueError:
+            pass
+    return {"success": True}
+
+
+@app.put("/api/tts/user/voices/{voice_id}/settings")
+async def update_user_voice_settings(request: Request, voice_id: int, settings: dict):
+    updated = await request.app.state.voice_store.update_voice_settings(voice_id, settings)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    return {"success": True, "voice": updated}
+
+
+@app.get("/api/tts/user/voices/enabled/{user_id}")
+async def get_enabled_voices(request: Request, user_id: int):
+    voice_ids = await request.app.state.voice_store.get_enabled_voice_ids(user_id)
+    return {"success": True, "voice_ids": voice_ids, "enabled_voice_ids": voice_ids}
+
+
+@app.post("/api/tts/user/voices/enabled/{user_id}")
+async def set_enabled_voices(request: Request, user_id: int, voice_ids: list[int]):
+    stored = await request.app.state.voice_store.set_enabled_voice_ids(user_id, voice_ids)
+    return {"success": True, "voice_ids": stored, "enabled_voice_ids": stored}
+
+
+@app.put("/api/tts/user/voices/{voice_id}/rename")
+async def rename_user_voice(
+    request: Request,
+    voice_id: int,
+    user_id: int,
+    new_name: str = Form(...),
+):
+    voice = await request.app.state.voice_store.get_voice_by_id(voice_id)
+    if not voice or int(voice.get("owner_id") or 0) != int(user_id):
+        raise HTTPException(status_code=404, detail="Voice not found")
+    try:
+        clean_name = sanitize_voice_name(new_name)
+        updated = await request.app.state.voice_store.rename_voice(voice_id, clean_name)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"success": True, "voice": updated}
+
+
+@app.post("/api/tts/user/voices/{voice_id}/retranscribe")
+async def retranscribe_user_voice(request: Request, voice_id: int, user_id: int):
+    voice = await request.app.state.voice_store.get_voice_by_id(voice_id)
+    if not voice or int(voice.get("owner_id") or 0) != int(user_id):
+        raise HTTPException(status_code=404, detail="Voice not found")
+    return await _retranscribe_voice_record(request, voice_id)
+
+
+@app.get("/api/admin/voices")
+async def admin_list_global_voices(request: Request):
+    return await _admin_voice_groups(request.app)
+
+
+@app.post("/api/admin/voices/upload")
+async def upload_admin_voice(
+    request: Request,
+    file: UploadFile = File(...),
+    name: str = Form(""),
+    voice_name: str = Form(""),
+):
+    raw_name = name or voice_name or file.filename or "global_voice"
+    target_path: Path | None = None
+    try:
+        clean_name = sanitize_voice_name(raw_name)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    try:
+        target_path, resolved_reference_text = await prepare_uploaded_voice_file(
+            voices_dir=request.app.state.voice_files_dir,
+            upload=file,
+            filename_prefix=f"global_{clean_name}",
+        )
+        voice = await request.app.state.voice_store.create_voice(
+            name=clean_name,
+            owner_id=None,
+            voice_type="global",
+            file_path=str(target_path),
+            is_public=True,
+            reference_text=resolved_reference_text or None,
+        )
+    except ValueError as error:
+        if target_path is not None:
+            target_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception:
+        if target_path is not None:
+            target_path.unlink(missing_ok=True)
+        raise
+
+    return {"success": True, "status": "success", "voice": _serialize_voice_record(voice)}
+
+
+@app.delete("/api/admin/voices/{voice_id}")
+async def delete_admin_voice(request: Request, voice_id: int):
+    voice = await request.app.state.voice_store.get_voice_by_id(voice_id)
+    if not voice:
+        raise HTTPException(status_code=404, detail="Voice not found")
+
+    deleted = await request.app.state.voice_store.delete_voice(voice_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Voice not found")
+
+    _cleanup_voice_file(request.app, voice)
+    return {"success": True}
+
+
+@app.put("/api/admin/voices/{voice_id}/rename")
+async def rename_admin_voice(request: Request, voice_id: int, new_name: str):
+    try:
+        clean_name = sanitize_voice_name(new_name)
+        updated = await request.app.state.voice_store.rename_voice(voice_id, clean_name)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    return {"success": True, "voice": _serialize_voice_record(updated)}
+
+
+@app.put("/api/admin/voices/{voice_id}/settings")
+async def update_admin_voice_settings(request: Request, voice_id: int, settings: dict):
+    updated = await request.app.state.voice_store.update_voice_settings(voice_id, settings)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    return {"success": True, "voice": _serialize_voice_record(updated)}
+
+
+@app.post("/api/admin/voices/{voice_id}/toggle")
+async def toggle_admin_voice(request: Request, voice_id: int):
+    updated = await request.app.state.voice_store.toggle_voice(voice_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    return {"success": True, "voice": _serialize_voice_record(updated)}
+
+
+@app.post("/api/admin/voices/{voice_id}/retranscribe")
+async def retranscribe_admin_voice(request: Request, voice_id: int):
+    return await _retranscribe_voice_record(request, voice_id)
+
+
+@app.post("/api/admin/voices/{voice_id}/transcribe")
+async def transcribe_admin_voice(request: Request, voice_id: int):
+    return await _retranscribe_voice_record(request, voice_id)
+
+
+@app.get("/api/admin/stats")
+async def admin_stats(request: Request, days: int = 7):
+    _ = days
+    stats_payload = await request.app.state.voice_store.stats()
+    return {"success": True, **stats_payload}
+
+
+@app.post("/api/admin/voices/test")
+async def admin_test_voice(
+    request: Request,
+    voice_name: str = Form(...),
+    user_id: int = Form(...),
+    test_text: str = Form(...),
+    model: str = Form("Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+):
+    if not test_text.strip():
+        raise HTTPException(status_code=400, detail="test_text is required")
+
+    resolved_model = _resolve_runtime_model(model, required_family="base")
+
+    voice_record, ref_wav, ref_sr = await _resolve_base_model_reference_voice(
+        request.app,
+        user_id_raw=user_id,
+        requested_voice=voice_name,
+    )
+    ref_text = str(voice_record.get("reference_text") or "").strip()
+    if not ref_text:
+        voice_path = Path(str(voice_record.get("file_path") or "")).resolve()
+        ref_text = await transcribe_voice_file(voice_path)
+        await request.app.state.voice_store.update_voice_settings(
+            int(voice_record["id"]),
+            {"reference_text": ref_text},
+        )
+
+    request_data = {
+        "model": resolved_model,
+        "text": test_text,
+        "language": "Russian",
+        "temperature": 0.9,
+        "instruction": "",
+        "speaker": str(voice_record.get("name") or ""),
+        "ref_audio": ref_wav,
+        "ref_sr": ref_sr,
+        "ref_text": ref_text,
+        "cancel_event": asyncio.Event(),
+        "channel_name": "voice_test",
+        "author": "voice_test",
+        "user_id": str(user_id),
+        "request_id": str(uuid.uuid4()),
+        "event_id": "",
+    }
+
+    preview_stream_id = f"preview-{uuid.uuid4()}"
+    preview_bytes = bytearray()
+    async with model_switch_lock:
+        await switch_model_if_needed(resolved_model)
+    try:
+        async for chunk in audio_stream_generator_async(preview_stream_id, request_data):
+            if chunk:
+                preview_bytes.extend(chunk)
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Preview synthesis failed: {error}") from error
+
+    filename = f"{preview_stream_id}.wav"
+    target_path = request.app.state.voice_preview_dir / filename
+    await asyncio.to_thread(target_path.write_bytes, bytes(preview_bytes))
+    return {
+        "success": True,
+        "audio_url": f"/api/audio/{filename}",
+        "voice": str(voice_record.get("name") or voice_name),
+        "selected_voice": str(voice_record.get("name") or voice_name),
+        "model": resolved_model,
+    }
 
 # Global state
 # These are re-declared here, but the ones above are the actual global state.
@@ -411,11 +937,14 @@ async def audio_stream_generator_async(stream_id: str, request_data: dict):
             )
             
         elif "Base" in model:
-            # 1. First, correct the `create_voice_clone_prompt` signature perfectly matching examples
-            prompt = interface.create_voice_clone_prompt(
-                ref_audio=(ref_audio, ref_sr),
-                ref_text=ref_text if ref_text else None,
-                x_vector_only_mode=False
+            loop = asyncio.get_running_loop()
+            prompt = await loop.run_in_executor(
+                None,
+                lambda: interface.create_voice_clone_prompt(
+                    ref_audio=(ref_audio, ref_sr),
+                    ref_text=ref_text if ref_text else None,
+                    x_vector_only_mode=False
+                ),
             )
             
             # 2. Custom ZMQ wrapper for Voice Clone
@@ -461,7 +990,6 @@ async def audio_stream_generator_async(stream_id: str, request_data: dict):
                         generate_icl_prompt_fn=generate_icl_prompt_fn,
                     )
                     
-            loop = asyncio.get_event_loop()
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = await loop.run_in_executor(None, _prep_voice_clone)
             async_gen = interface.generate_async(
                 talker_input_embeds,
@@ -600,6 +1128,8 @@ async def prepare_stream(
     channel_name: str = Form(""),
     author: str = Form(""),
     user_id: str = Form(""),
+    request_id: str = Form(""),
+    event_id: str = Form(""),
 ):
     """
     Endpoint 1: Receives form data and enqueues a stream request.
@@ -607,12 +1137,14 @@ async def prepare_stream(
     if temperature <= 0:
         raise HTTPException(status_code=400, detail="temperature must be > 0")
 
+    required_family = "base" if "Base" in model else None
+    resolved_model = _resolve_runtime_model(model, required_family=required_family)
     stream_id = str(uuid.uuid4())
 
     # We delay the generator creation to the GET request because async generation
     # must be instantiated inside the same event loop task the StreamingResponse consumes it from.
     request_data = {
-        "model": model,
+        "model": resolved_model,
         "text": text,
         "language": language,
         "temperature": float(temperature),
@@ -622,47 +1154,63 @@ async def prepare_stream(
         "channel_name": channel_name,
         "author": author,
         "user_id": user_id,
+        "request_id": request_id,
+        "event_id": event_id,
     }
     
-    if "Base" in model:
-        if not ref_audio:
-            raise HTTPException(status_code=400, detail="Base model requires ref_audio")
-        
-        audio_bytes = await ref_audio.read()
-        ref_wav, ref_sr = sf.read(io.BytesIO(audio_bytes))
-        request_data["ref_audio"] = ref_wav
-        request_data["ref_sr"] = ref_sr
-        
-        if not ref_text.strip():
-            print(f"[STREAM {stream_id[:8]}] 🤖 Auto-transcribing reference audio with Whisper...")
-            try:
-                from faster_whisper import WhisperModel
-                import tempfile
-                
-                # Faster-whisper accepts file paths or 16000Hz numpy arrays.
-                # Writing exactly to disk is the safest parsing method for av.
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp.write(audio_bytes)
-                    tmp_path = tmp.name
-                    
-                # Load small model on GPU (takes ~1-2 secs first time, caches in VRAM)
-                whisper_model = WhisperModel("tiny", device="cuda" if torch.cuda.is_available() else "cpu", compute_type="float16" if torch.cuda.is_available() else "int8")
-                segments, info = whisper_model.transcribe(tmp_path, beam_size=5)
-                
-                # Combine all segments
-                transcribed_text = " ".join([segment.text for segment in segments]).strip()
-                os.unlink(tmp_path)
-                
-                if not transcribed_text:
-                    raise ValueError("Whisper transcribed an empty string")
-                    
-                print(f"[STREAM {stream_id[:8]}] 📝 Auto-transcription result: '{transcribed_text}'")
-                request_data["ref_text"] = transcribed_text
-            except Exception as e:
-                print(f"[STREAM {stream_id[:8]}] ❌ Auto-transcription failed: {e}")
-                raise HTTPException(status_code=400, detail="Reference text was empty and Auto-Transcription failed. Please provide text manually.")
+    if "Base" in resolved_model:
+        if ref_audio:
+            audio_bytes = await ref_audio.read()
+            ref_wav, ref_sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+            if getattr(ref_wav, "ndim", 1) > 1:
+                ref_wav = np.mean(ref_wav, axis=1).astype(np.float32)
+            request_data["ref_audio"] = ref_wav
+            request_data["ref_sr"] = ref_sr
+
+            resolved_ref_text = str(ref_text or "").strip()
+            if not resolved_ref_text:
+                print(f"[STREAM {stream_id[:8]}] Auto-transcribing uploaded reference audio...")
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        tmp.write(audio_bytes)
+                        tmp_path = Path(tmp.name)
+                    try:
+                        resolved_ref_text = await transcribe_voice_file(tmp_path)
+                    finally:
+                        tmp_path.unlink(missing_ok=True)
+                    print(f"[STREAM {stream_id[:8]}] Auto-transcription result: '{resolved_ref_text}'")
+                except Exception as error:
+                    print(f"[STREAM {stream_id[:8]}] Auto-transcription failed: {error}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Reference text was empty and auto-transcription failed. Please provide text manually.",
+                    ) from error
+            request_data["ref_text"] = resolved_ref_text
         else:
-            request_data["ref_text"] = ref_text
+            voice_record, ref_wav, ref_sr = await _resolve_base_model_reference_voice(
+                app,
+                user_id_raw=user_id,
+                requested_voice=speaker,
+            )
+            request_data["ref_audio"] = ref_wav
+            request_data["ref_sr"] = ref_sr
+            request_data["speaker"] = str(voice_record.get("name") or speaker or "")
+
+            resolved_ref_text = str(ref_text or voice_record.get("reference_text") or "").strip()
+            if not resolved_ref_text:
+                voice_path = Path(str(voice_record.get("file_path") or "")).resolve()
+                try:
+                    resolved_ref_text = await transcribe_voice_file(voice_path)
+                    await app.state.voice_store.update_voice_settings(
+                        int(voice_record["id"]),
+                        {"reference_text": resolved_ref_text},
+                    )
+                except Exception as error:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Stored Qwen clone voice has no reference_text and retranscription failed.",
+                    ) from error
+            request_data["ref_text"] = resolved_ref_text
 
     tenant_key = _normalize_tenant_id(tenant_id, channel_name)
 
@@ -1042,6 +1590,13 @@ async def serve_ui():
     return HTMLResponse(content=HTML_UI, status_code=200)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Qwen3-TTS streaming API server")
+    parser.add_argument("--host", default=SERVER_HOST)
+    parser.add_argument("--port", type=int, default=SERVER_PORT)
+    args = parser.parse_args()
+
     print("\nStarting Qwen3-TTS Streaming API Server...")
-    print("Go to: http://127.0.0.1:8000\n")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print(f"Go to: http://127.0.0.1:{args.port}\n")
+    uvicorn.run(app, host=args.host, port=args.port)
+
+
