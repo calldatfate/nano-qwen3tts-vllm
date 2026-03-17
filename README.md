@@ -232,12 +232,22 @@ The API supports 5 model variants, accessible via the `model` parameter:
 
 By default the worker can expose the full catalog above. For production deployments it is usually better to expose only the model you actually run:
 
+`.env.example` is intentionally single-model-first. Multi-model envs stay supported, but should be added only when you deliberately need them.
+
+- `QWEN_ALLOWED_MODELS=base`
+  - recommended shared alias when `bot_service` and the runtime should expose the same catalog
 - `QWEN3_TTS_MODEL_PATH=<exact model id or local path>`
   - exposes a single runtime model via `/api/models`
 - `QWEN_TTS_ALLOWED_MODELS=base`
-  - exposes only the requested family
+  - exposes only the requested family and overrides `QWEN_ALLOWED_MODELS` when both are set
 - `QWEN_TTS_ALLOWED_MODELS=Qwen/Qwen3-TTS-12Hz-0.6B-Base,Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`
   - exposes only the listed exact models
+
+Recommended split-deploy pattern:
+
+- set `QWEN_ALLOWED_MODELS` to the same value in `bot_service` and in this runtime repo
+- use `QWEN_CLOUD_ALLOWED_MODELS` only for backend-only overrides
+- use `QWEN_TTS_ALLOWED_MODELS` only for runtime-only overrides
 
 Keep `QWEN_VOICE_STORAGE_DIR` on a persistent shared volume. Stored voice samples survive runtime restarts and become usable again when a `Base` runtime is brought back online.
 

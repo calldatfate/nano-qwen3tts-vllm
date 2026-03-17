@@ -17,6 +17,7 @@ services:
       HF_HOME: /root/.cache/huggingface
       QWEN_TTS_PORT: "8012"
       QWEN_VOICE_STORAGE_DIR: /app/runtime/qwen_voices
+      QWEN_ALLOWED_MODELS: ${QWEN_ALLOWED_MODELS:-}
       QWEN3_TTS_MODEL_PATH: ${QWEN3_TTS_MODEL_PATH:-}
       QWEN_TTS_ALLOWED_MODELS: ${QWEN_TTS_ALLOWED_MODELS:-}
     ports:
@@ -44,6 +45,7 @@ services:
       USE_ZMQ: "0"
       HF_HOME: /root/.cache/huggingface
       QWEN_VOICE_STORAGE_DIR: /app/runtime/qwen_voices
+      QWEN_ALLOWED_MODELS: ${QWEN_ALLOWED_MODELS:-}
       QWEN3_TTS_MODEL_PATH: ${QWEN3_TTS_MODEL_PATH:-}
       QWEN_TTS_ALLOWED_MODELS: ${QWEN_TTS_ALLOWED_MODELS:-}
     ports:

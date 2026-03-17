@@ -94,8 +94,19 @@ def _runtime_configured_model() -> str | None:
 
 
 def _runtime_allowed_models_raw() -> str | None:
-    candidate = str(os.environ.get("QWEN_TTS_ALLOWED_MODELS", "")).strip()
-    return candidate or None
+    for env_name in ("QWEN_TTS_ALLOWED_MODELS", "QWEN_ALLOWED_MODELS"):
+        candidate = str(os.environ.get(env_name, "")).strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def _runtime_allowed_models_source() -> str | None:
+    for env_name in ("QWEN_TTS_ALLOWED_MODELS", "QWEN_ALLOWED_MODELS"):
+        candidate = str(os.environ.get(env_name, "")).strip()
+        if candidate:
+            return env_name
+    return None
 
 
 def _runtime_model_catalog() -> list[dict[str, object]]:
@@ -376,6 +387,7 @@ async def get_supported_models():
         "current_model": current_model_name,
         "configured_model": _runtime_configured_model(),
         "model_policy": "restricted" if _runtime_allowed_models_raw() or _runtime_configured_model() else "dynamic",
+        "allowed_models_source": _runtime_allowed_models_source(),
         "models": models,
     }
 
@@ -1598,5 +1610,4 @@ if __name__ == "__main__":
     print("\nStarting Qwen3-TTS Streaming API Server...")
     print(f"Go to: http://127.0.0.1:{args.port}\n")
     uvicorn.run(app, host=args.host, port=args.port)
-
 
