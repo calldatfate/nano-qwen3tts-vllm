@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nano-qwen3tts-vllm"
 version = "0.1.0"
-description = "Add your description here"
+description = "Qwen3-TTS streaming runtime with fair queueing, voice CRUD, and nano-vLLM integrations."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,9 +16,14 @@ dependencies = [
     "torch>=2.1.0",
     "transformers>=4.57.3",
     "pyzmq>=27.1.0",
-    "asyncio>=4.0.0",
     "xxhash>=3.6.0",
 ]
 
-[tool.setuptools.package-dir]
-"nano_qwen3tts_vllm" = "nano-qwen3tts-vllm"
+[project.optional-dependencies]
+dev = [
+    "pytest==8.4.1",
+    "pytest-asyncio==0.25.3",
+]
+
+[tool.setuptools.packages.find]
+include = ["nano_qwen3tts_vllm*"]

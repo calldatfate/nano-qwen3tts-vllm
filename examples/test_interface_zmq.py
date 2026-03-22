@@ -2,7 +2,7 @@
 Standalone test for Qwen3TTSInterface with ZMQ (asyncio engine loop + asyncio queue).
 
 Usage:
-  cd nano-qwen3tts-vllm/examples
+  cd examples
   python test_interface_zmq.py --model-path Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
 
 Arguments:

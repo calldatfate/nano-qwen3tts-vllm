@@ -52,6 +52,9 @@ output_ru.wav
 .env
 .venv
 tmp/
+.tmp/
+.uv-cache/
+.pytest_tmp/
 pytest-cache-files-*/
 .pytest_cache/
 .ruff_cache/

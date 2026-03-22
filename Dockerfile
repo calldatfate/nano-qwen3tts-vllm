@@ -40,8 +40,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt constraints-docker.txt pyproject.toml README.md /app/
-COPY api_server.py web_ui.py voice_store.py voice_uploads.py runtime_models.py /app/
-COPY nano-qwen3tts-vllm /app/nano-qwen3tts-vllm
+COPY api_server.py web_ui.py /app/
+COPY nano_qwen3tts_vllm /app/nano_qwen3tts_vllm
 COPY examples /app/examples
 
 RUN uv python install ${PYTHON_VERSION} && \

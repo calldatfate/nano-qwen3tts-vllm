@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "nano-qwen3tts-vllm"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).parent / "Qwen3-TTS"))
 
 TEST_TEXT = "Hello world! This is a benchmark test to compare the performance of different implementations."

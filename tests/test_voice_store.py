@@ -1,18 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
-import shutil
-
 import pytest
 
-from voice_store import FileVoiceStore
+from nano_qwen3tts_vllm.voice_store import FileVoiceStore
 
 
 @pytest.mark.asyncio
-async def test_voice_store_toggle_and_stats():
-    tmp_path = Path.cwd() / "tmp" / "qwen_voice_store_toggle_test"
-    shutil.rmtree(tmp_path, ignore_errors=True)
-    tmp_path.mkdir(parents=True, exist_ok=True)
+async def test_voice_store_toggle_and_stats(tmp_path):
     store = FileVoiceStore(tmp_path / "state.json", tmp_path / "voices")
 
     global_voice = await store.create_voice(
@@ -45,10 +39,7 @@ async def test_voice_store_toggle_and_stats():
 
 
 @pytest.mark.asyncio
-async def test_list_global_voices_returns_only_active_global_entries():
-    tmp_path = Path.cwd() / "tmp" / "qwen_voice_store_global_test"
-    shutil.rmtree(tmp_path, ignore_errors=True)
-    tmp_path.mkdir(parents=True, exist_ok=True)
+async def test_list_global_voices_returns_only_active_global_entries(tmp_path):
     store = FileVoiceStore(tmp_path / "state.json", tmp_path / "voices")
 
     global_voice = await store.create_voice(

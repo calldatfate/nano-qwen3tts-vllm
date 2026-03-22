@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from runtime_models import build_runtime_model_catalog, pick_runtime_model
+from nano_qwen3tts_vllm.runtime_models import build_runtime_model_catalog, pick_runtime_model
 
 
 def test_runtime_model_catalog_uses_single_configured_model():

@@ -1,9 +1,15 @@
-from __future__ import annotations
+"""Qwen3-TTS with vLLM-style optimizations."""
 
-from pathlib import Path
+from nano_qwen3tts_vllm.config import (
+    Qwen3TTSTalkerCodePredictorConfig,
+    Qwen3TTSTalkerConfig,
+)
+from nano_qwen3tts_vllm.sampling_params import SamplingParams
 
-_SOURCE_DIR = Path(__file__).resolve().parent.parent / "nano-qwen3tts-vllm"
+__version__ = "0.1.0"
 
-# Allow `python api_server.py` without requiring `pip install -e .`.
-__path__ = [str(_SOURCE_DIR)]
-
+__all__ = [
+    "Qwen3TTSTalkerConfig",
+    "Qwen3TTSTalkerCodePredictorConfig",
+    "SamplingParams",
+]
