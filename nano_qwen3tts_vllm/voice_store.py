@@ -259,10 +259,19 @@ class FileVoiceStore:
         try:
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
                 handle.write(body)
-            os.replace(tmp_name, self.state_path)
+            try:
+                os.replace(tmp_name, self.state_path)
+            except PermissionError:
+                # Some Windows environments deny atomic replace inside sandboxed or watched
+                # directories even though plain file writes are allowed. Fall back to a direct
+                # write so the local file-backed store stays usable.
+                self.state_path.write_text(body, encoding="utf-8")
         finally:
             if os.path.exists(tmp_name):
-                os.remove(tmp_name)
+                try:
+                    os.remove(tmp_name)
+                except PermissionError:
+                    pass
 
     def _active_voices_for_user(self, user_id: int | None) -> list[dict[str, Any]]:
         voices = self._read_state()["voices"]

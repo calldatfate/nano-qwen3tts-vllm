@@ -1,4 +1,4 @@
-services:
+﻿services:
   api:
     build:
       context: .
@@ -9,7 +9,7 @@ services:
         FLASH_ATTN_NVCC_THREADS: ${FLASH_ATTN_NVCC_THREADS:-1}
         FLASH_ATTN_VERSION: ${FLASH_ATTN_VERSION:-2.8.3}
         FLASH_ATTN_ALLOW_SOURCE_BUILD: ${FLASH_ATTN_ALLOW_SOURCE_BUILD:-0}
-    image: nano-qwen3tts-vllm:latest
+    image: ${QWEN_IMAGE:-nano-qwen3tts-vllm:local}
     container_name: nano-qwen3tts-api
     command: python api_server.py
     environment:
@@ -38,7 +38,7 @@ services:
         FLASH_ATTN_NVCC_THREADS: ${FLASH_ATTN_NVCC_THREADS:-1}
         FLASH_ATTN_VERSION: ${FLASH_ATTN_VERSION:-2.8.3}
         FLASH_ATTN_ALLOW_SOURCE_BUILD: ${FLASH_ATTN_ALLOW_SOURCE_BUILD:-0}
-    image: nano-qwen3tts-vllm:latest
+    image: ${QWEN_IMAGE:-nano-qwen3tts-vllm:local}
     container_name: nano-qwen3tts-web
     command: python web_ui.py
     environment:
