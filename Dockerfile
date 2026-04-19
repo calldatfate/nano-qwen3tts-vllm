@@ -30,6 +30,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    curl \
     ninja-build \
     ffmpeg \
     sox \
@@ -55,8 +56,9 @@ RUN uv python install ${PYTHON_VERSION} && \
         ([ "${FLASH_ATTN_ALLOW_SOURCE_BUILD}" = "1" ] && python -m pip install --no-build-isolation "flash-attn==${FLASH_ATTN_VERSION}")) && \
     python -m pip install --no-deps -e .
 
-EXPOSE 8012 7860
+EXPOSE 8000 7860
 
 ENV USE_ZMQ=1
+ENV PORT=8000
 
 CMD ["python", "api_server.py"]

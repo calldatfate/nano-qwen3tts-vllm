@@ -7,11 +7,18 @@ __pycache__
 *.pyo
 *.pyd
 *.log
+.env
+.env.*
 
 venv
 venv_wsl
 env
 .venv
+_pytest_cache
+_pytest_tmp
+_tmp
+tmp
+tmp_runtime_logs
 
 *.wav
 *.mp3
@@ -21,3 +28,6 @@ env
 dist
 build
 *.egg-info
+tests
+.benchmarks
+runtime

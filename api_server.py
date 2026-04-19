@@ -7,10 +7,11 @@ from pathlib import Path
 
 import torch._dynamo
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
+from nano_qwen3tts_vllm.auth import reject_unauthorized_request
 from nano_qwen3tts_vllm.model_runtime import ModelRuntime
 from nano_qwen3tts_vllm.runtime_policy import (
     resolve_runtime_model_or_409,
@@ -98,6 +99,14 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 app.include_router(voice_api_service.build_router())
 app.include_router(stream_service.build_router())
 
+
+@app.middleware("http")
+async def enforce_api_key(request: Request, call_next):
+    rejection = reject_unauthorized_request(request)
+    if rejection is not None:
+        return rejection
+    return await call_next(request)
+
 HTML_UI = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -131,6 +140,8 @@ HTML_UI = """
             Звук начинает воспроизводиться прямо в браузере сразу после получения ПЕРВОГО миллисекундного чанка (TTFT), не дожидаясь генерации всего текста! <br><br>
             <b>Для программистов:</b> Это работает через обычный REST API: сначала POST-запрос на <code>/api/prepare</code>, затем GET-стриминг <code>/api/stream/{id}</code>.
         </div>
+        <label>API Key</label>
+        <input type="password" id="apiKeyInput" placeholder="Required when API_KEY is configured">
         <form id="tts-form">
             <label>Выбор модели</label>
             <select id="modelSelect" name="model" onchange="updateUI()">
@@ -193,7 +204,7 @@ HTML_UI = """
         async function stopTTS() {
             if (currentStreamId) {
                 try {
-                    await fetch(`/api/cancel/${currentStreamId}`, { method: 'POST' });
+                    await fetch(`/api/cancel/${currentStreamId}`, { method: 'POST', headers: buildApiHeaders() });
                     const statusDiv = document.getElementById('status');
                     statusDiv.textContent = "Воспроизведение остановлено вручную.";
                     statusDiv.className = "status error";
@@ -215,6 +226,16 @@ HTML_UI = """
             document.getElementById('generateBtn').disabled = false;
             document.getElementById('stopBtn').disabled = true;
             currentStreamId = null;
+        }
+        function buildApiHeaders() {
+            const apiKey = (document.getElementById('apiKeyInput')?.value || '').trim();
+            if (!apiKey) {
+                return {};
+            }
+            return {
+                'Authorization': `Bearer ${apiKey}`,
+                'X-API-Key': apiKey,
+            };
         }
         async function generateTTS() {
             const generateBtn = document.getElementById('generateBtn');
@@ -242,7 +263,7 @@ HTML_UI = """
                     formData.append('ref_text', document.getElementById('ref_text').value);
                 }
                 const t0 = performance.now();
-                const response = await fetch('/api/prepare', { method: 'POST', body: formData });
+                const response = await fetch('/api/prepare', { method: 'POST', body: formData, headers: buildApiHeaders() });
                 const data = await response.json();
                 if (!response.ok) {
                     throw new Error(data.detail || "Неизвестная ошибка API");
@@ -251,7 +272,10 @@ HTML_UI = """
                 currentStreamId = data.stream_id;
                 statusDiv.textContent = `Подготовка заняла ${Math.round(t1 - t0)}мс. Подключаемся к потоку звука... Слушайте!`;
                 statusDiv.className = 'status success';
-                player.src = `/api/stream/${currentStreamId}`;
+                const apiKey = (document.getElementById('apiKeyInput')?.value || '').trim();
+                player.src = apiKey
+                    ? `/api/stream/${currentStreamId}?api_key=${encodeURIComponent(apiKey)}`
+                    : `/api/stream/${currentStreamId}`;
                 player.style.display = 'block';
                 player.play().catch(() => {});
                 player.onended = () => {
